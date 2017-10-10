@@ -896,13 +896,18 @@ class RoadImage(np.ndarray):
 
     __red_green_cmap__ = None
         
-    def show(self, axis, cmap=None):
+    def show(self, axis, cmap=None, alpha=True):
         """
         Display image using matplotlib.pyplot.
+        cmap is a colormap from matplotlib library. It is used only for single channel images and sensible defaults
+        are provided.
+        alpha can be set to False to ignore the alpha layer in RGBA images.
         """
         nb_ch = RoadImage.image_channels(self)
-        assert nb_ch == 1 or nb_ch == 3, 'RoadImage.show: Can only display single channel or three channel images.'
-        assert self.ndim == 3, 'RoadImage.show: Can only display single images, not collections.'
+        assert nb_ch == 1 or nb_ch == 3 or nb_ch == 4, \
+            'RoadImage.show: Can only display single channel, RGB or RGBA images.'
+        flat = self.flatten()
+        assert flat.shape[0] == 1, 'RoadImage.show: Can only display single images.'
 
         import matplotlib as mp
         assert issubclass(type(axis), mp.axes.Axes), \
@@ -916,19 +921,25 @@ class RoadImage(np.ndarray):
                         colors = [(1, 0, 0), (0, 0, 0), (0, 1, 0)]  # R -> Black -> G
                         RoadImage.__red_green_cmap__ = mp.colors.LinearSegmentedColormap.from_list('RtoG', colors, N=256) 
                     cmap = RoadImage.__red_green_cmap__
-                img = self.to_float()[:,:,0]
+                img = flat[0,:,:,0].to_float()
                 axis.imshow(img, vmin=-1, vmax=1, cmap = cmap)
             else:
-                img = self.to_float()
+                if alpha:
+                    img = flat[0].to_float()
+                else:
+                    img = flat[0,:,:,0:3].to_float()
                 axis.imshow(np.abs(img), vmin=0, vmax=1)
         else:
             if nb_ch == 1:
                 if cmap is None:
                     cmap = 'gray'
-                img = self.to_float()[:,:,0]
+                img = flat[0,:,:,0].to_float()
                 axis.imshow(img, cmap=cmap, vmin=0, vmax=1)
             else:
-                img = self.to_float()
+                if alpha:
+                    img = flat[0].to_float()
+                else:
+                    img = flat[0,:,:,0:3].to_float()
                 axis.imshow(img)
                 
     # Deep copy
