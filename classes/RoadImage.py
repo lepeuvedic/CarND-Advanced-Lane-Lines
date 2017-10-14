@@ -308,7 +308,6 @@ class RoadImage(np.ndarray):
         for ops, ch in obj.child.items():
             for op in ops:
                 # Check each op in long ops
-                #print(op)
                 # With decorators, the function pointer stored in the tuple is not the same function
                 if not(op[0].__name__ in cls.AUTOUPDATE):
                     # Found an op which does not support automatic updates
@@ -478,12 +477,12 @@ class RoadImage(np.ndarray):
     def select_ops(cls,ops, selected):
         """
         Processes a sequence of operations to keep only those selected.
-        selected must be a list of RoadImage methods (RoadImage.convert_color, ...).
-        ops must be in normal form (find_op(normal=True)).
+        selected must be a list of RoadImage method names ('convert_color', 'to_grayscale', ...).
+        ops must be a long op, as returned by find_op(raw=False).
         """
         if ops == ():
             return ()
-        assert issubclass(type(ops[0]), tuple), 'RoadImage.select_ops: ops must be a tuple of tuples (normal form).'
+        assert issubclass(type(ops[0]), tuple), 'RoadImage.select_ops: BUG ops format is invalid: '+repr(ops)
         ret = ()
         for op in ops:
             if op[0] in selected: ret += (op,)
@@ -502,10 +501,7 @@ class RoadImage(np.ndarray):
         
         # Using a simple tuple for simple ops is deprecated. Even single ops shall be stored as tuple of tuple.
         if ops:
-            if not(type(ops[0]) is tuple):
-                warnings.warn('RoadImage.pretty_print_ops: operation %s stored in deprecated format.' % str(ops[0]),
-                             DeprecationWarning)
-                return RoadImage.pretty_print_ops((ops,))
+            assert type(ops[0]) is tuple, 'RoadImage.pretty_print_ops: BUG operation format is invalid: '+str(ops[0])
             out = []
             for op in ops:
                 # Process each op: there are at most three
@@ -547,8 +543,8 @@ class RoadImage(np.ndarray):
         """
         assert  len(lst)>0 , 'RoadImage.make_collection: Called with an empty list.'
         for i,img in enumerate(lst):
-            assert issubclass(type(img),RoadImage), \
-                'RoadImage.make_collection: List elements must be type RoadImage. Check element %s.' % str(i)
+            if not( issubclass(type(img),RoadImage) ):
+                raise ValueError('RoadImage.make_collection: List elements must be type RoadImage. Check element %d.'% i)
         if dtype is None:
             dtype = lst[0].dtype
         assert len(lst[0].shape) >= 3, 'RoadImage.make_collection: BUG: Found RoadImage with less then 3 dims in lst.'
@@ -787,9 +783,9 @@ class RoadImage(np.ndarray):
         In most cases, self becomes read only, but when ch is a numpy view (changes to self propagate
         automatically since the underlying data is the same), call with unlocked = True.
         """
-        if not(issubclass(type(op[0]),tuple)):
-            warnings.warn('RoadImage.__add_child: BUG: Trying to add old-style short op', DeprecationWarning)
-            op = (op,)
+        assert issubclass(type(op[0]),tuple), 'RoadImage.__add_child: BUG: Trying to add old-style short op'
+        assert not(issubclass(type(op[0][0]),str)) , 'RoadImage.__add_child__: BUG: Storing string key'
+
         # Check if ch is already a child under some other operation
         # A fake crop operation may have been automatically assigned
         old_op = ()
@@ -808,27 +804,23 @@ class RoadImage(np.ndarray):
             assert old_op[0][0].__name__ == 'crop' , \
                 'RoadImage.__add_child__: BUG: returned instance is already a child. Conflict with %s.' % str(old_op)
             del parent.child[old_op] 
-            #for oldop, sibling in parent.child.items():
-            #    if sibling is self:
-            #        del parent.child[oldop]
-            #        break  # Do not continue iterations on modified dictionary
         # Make parent read-only: TODO in the future we would recompute the children automatically
         self.flags.writeable = unlocked
         # Link ch to self
         ch.parent = self
-        assert not(issubclass(type(op[0][0]),str)) , 'RoadImage.__add_child__: BUG: Storing bad key'
         self.child[op] = ch
-
         
     # Save to file
-    def save(self, filename, format='png'):
+    @strict_accepts(object, str, str)
+    def save(self, filename, *, format='png'):
         """
         Save to file using matplotlib.image. Default is PNG format.
         """
-        assert filename != self.filename , ValueError('RoadImage.save: attempt to save into original file %s.' % filename)
+        if filename == self.filename:
+            raise ValueError('RoadImage.save: attempt to save into original file %s.' % filename)
         nb_ch = RoadImage.image_channels(self)
-        assert nb_ch == 1 or nb_ch == 3 or nb_ch == 4, \
-            'RoadImage.show: Can only save single channel, RGB or RGBA images.'
+        if not(nb_ch in [1,3,4]):
+            raise ValueError('RoadImage.show: Can only save single channel, RGB or RGBA images.')
         flat = self.flatten()
         assert flat.shape[0] == 1, 'RoadImage.show: Can only save single images.'
         mpimg.imsave(filename, flat[0], format=format)
@@ -934,7 +926,7 @@ class RoadImage(np.ndarray):
         return self.channels(n,n+1)
 
     @strict_accepts(object,int,int)
-    @generic_search(True)
+    @generic_search(unlocked=True)
     @flatten_collection
     def channels(self,n,m):
         """
@@ -1009,25 +1001,14 @@ class RoadImage(np.ndarray):
             return self
         assert RoadImage.cspace_to_nb_channels(self.colorspace) == 3 and self.shape[-1]==3 , \
                'RoadImage.to_grayscale: BUG: shape is inconsistent with colorspace.'
-        # Check if grayscale version of self already exists
-        #op = (RoadImage.to_grayscale,)
-        #ret = self.find_child(op)
-        #if not(ret is None): return ret
-        
-        #ret = rgb.find_child(op)
-        #if not(ret is None): return ret
+
         ret = np.empty_like(self[:,:,:,0:1])
         ret.colorspace='GRAY'
 
         for i, img in enumerate(self):
             rgb = img.convert_color('RGB')  # conversion will be optimised out if possible. rgb child of self.
             ret[i] = np.expand_dims(cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY),-1)
-        #ret = img.view(RoadImage)
-        #ret.__array_finalize__(self)  # Run __array_finalize__ again using rgb as a template, rather than img.
-        #assert ret.parent is None, \
-        #    'RoadImage.to_grayscale: BUG: operation %s conflicts with to_grayscale.' % str(ret.find_op(ret.parent))
-        #ret.parent = rgb
-        #rgb.child[op] = ret
+
         return ret
     
     # Format conversions
@@ -1041,10 +1022,6 @@ class RoadImage(np.ndarray):
         if self.dtype == np.uint8 or self.dtype == np.uint8:
             # Already int
             return self
-        # Check if int version of self alredy exists
-        #op = (RoadImage.to_int,)
-        #ret = self.find_child(op)
-        #if not(ret is None): return ret
 
         # Expensive input tests
         assert np.max(self) <= 1.0 , 'RoadImage.to_int: maximum value of input is greater than one.'
@@ -1064,14 +1041,7 @@ class RoadImage(np.ndarray):
             ret[:] = self #.astype(np.int8)
         else:
             ret[:] = np.round(self * scaling) #.astype(np.int8)
-        #else:
-        #    if self.binary:
-        #        img = self.astype(np.uint8)
-        #    else:
-        #        img = np.round(self * 255.).astype(np.uint8)
-        
-        #ret.__array_finalize__(self)  # Run __array_finalize__ again on self, rather than img.
-        #self.__add_child__(ret, op)
+
         return ret
 
     @generic_search()
@@ -1084,10 +1054,6 @@ class RoadImage(np.ndarray):
         if self.dtype == np.float32 or self.dtype == np.float64:
             # Already float
             return self
-        # Check if float version of self already exists
-        #op = (RoadImage.to_float,)
-        #ret = self.find_child(op)
-        #if not(ret is None): return ret
 
         if self.gradient:
             if self.dtype == np.uint8 and np.max(self) > 127:
@@ -1106,11 +1072,7 @@ class RoadImage(np.ndarray):
             ret[:] = self #.astype(np.float32)
         else:
             ret[:] = scaling * self #.astype(np.float32)
-        #else:
-        #    img = self.astype(np.float32) / 255.0
-        #ret = img.view(RoadImage)
-        #ret.__array_finalize__(self)
-        #self.__add_child__(ret, op)
+
         return ret
 
     # Remove camera distortion
@@ -1360,22 +1322,8 @@ class RoadImage(np.ndarray):
             # Normalize
             ret[:] = scalef * self.astype(np.float32)
             del scalef
-            #if self.dtype == np.int8 or self.dtype == np.uint8:
-            #    norm = np.round(norm)
-            
-            #if inplace:
-            #    np.copyto(self, norm, casting='unsafe')
-            #    del norm
-            #    return self
-            
-        # Make new child and link parent to child
-        #ret = RoadImage(norm, cspace = self.colorspace)
 
-        #del norm
         return ret
-
-    #def resize(self):
-    # When the need arises...
 
     @strict_accepts(object, (float, int, np.ndarray), (float, int, np.ndarray), bool, bool)
     @generic_search()
@@ -1415,14 +1363,6 @@ class RoadImage(np.ndarray):
         if issubclass(type(maxi),float) or issubclass(type(maxi),int):
             maxi = np.array([maxi], dtype=np.float32)
 
-        
-        #if mini is None:
-        #    op = (RoadImage.threshold, 'max', maxi.shape, tuple(maxi.ravel()))
-        #elif maxi is None:
-        #    op = (RoadImage.threshold, 'min', mini.shape, tuple(mini.ravel()))
-        #else:
-        #    op = (RoadImage.threshold, 'minmax', mini.shape, tuple(mini.ravel()), maxi.shape, tuple(maxi.ravel()))
-
         # Scale, cast and reshape mini according to self.dtype
         if not(mini is None):
             assert np.all((mini >= 0.0) & (mini <= 1.0)) , 'RoadImage.threshold: Arg mini must be between 0.0 and 1.0 .'
@@ -1460,7 +1400,6 @@ class RoadImage(np.ndarray):
                 dtype = np.int8
             else:
                 dtype = np.uint8
-            #ret = RoadImage(np.zeros(self.shape, dtype=dtype), src_cspace = self.colorspace)
             ret = np.zeros_like(self, dtype=dtype)
             ret.colorspace = self.colorspace
             ret.binary = True
@@ -1486,12 +1425,6 @@ class RoadImage(np.ndarray):
                 ret[(data >= mini) & (data <= maxi)] = 1
 
         self.binary = True
-        # update record of operations in parent
-        #self.__update_parent__(op)
-            
-        #ret = self.find_child(op)
-        #if not(ret is None): return ret
-        #self.__add_child__(ret, op)
         return ret
         
     def warp(self, scale):
@@ -1501,12 +1434,18 @@ class RoadImage(np.ndarray):
         """
         return self
 
+    @strict_accepts(object, tuple)
+    @generic_search(unlocked=True)
+    @flatten_collection
     def crop(self, area):
         """
         Returns a cropped image, same as using the [slice,slice] notation, but it accepts
         directly the output of self.get_crop().
         """
-        return self
+        (x1,y1),(x2,y2) = area
+        if x2<=x1 or y2<=y1:
+            raise ValueError('RoadImage.crop: crop area must not be empty.')
+        return self[:,y1:y2,x1:x2,:]
 
     def __slice__(self):
         """
