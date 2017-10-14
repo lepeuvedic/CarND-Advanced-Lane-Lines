@@ -241,7 +241,9 @@ def flatten_collection(f):
         flat = self.flatten()
         ret = f(flat, *args, **kwargs)
         # Put the collection back in the original shape
-        return ret.reshape(self.shape[:-3]+ret.shape[1:])
+        ret = ret.reshape(self.shape[:-3]+ret.shape[1:])
+        # reshape sets ret.crop_area to full image size
+        return ret
     return flat_wrapper
     
 def varnames(f):

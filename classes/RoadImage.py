@@ -240,6 +240,7 @@ class RoadImage(np.ndarray):
             # From new-from-template - e.g img[:3]
             #    type(obj) is RoadImage
             # If the object we build from is a RoadImage, we link child to parent and parent to child
+            # but @generic_search will overwrite this link for operations other than those inferred above.
             if issubclass(type(obj), RoadImage):
                 if is_inside:
                     obj.__add_child__(self, op, unlocked=True)
@@ -261,13 +262,6 @@ class RoadImage(np.ndarray):
         # Stop referencing parent
         self.parent = None
         
-        # The rest is automatically performed by the weak collection
-        # Remove self from parent's children
-        #if not(self.parent is None):
-        #    op = self.find_op(quiet=True)
-        #    #print('destructor of',op)
-        #    if op: del self.parent.child[op]
-        
     def unlink(self):
         """
         Detaches a RoadImage from its parent.
@@ -276,17 +270,18 @@ class RoadImage(np.ndarray):
               with the parent now share data with self. 
         """
         # When data is shared, self.crop_area is not None
-        if self.crop_area:
+        if self.shares_data(self.parent):
             raise ValueError('RoadImage.unlink: Cannot unlink views that share data with parent.')
         # Remove self from parent's children
         if not(self.parent is None):
-            for op, sibling in self.parent.child.items():
-                if sibling is self:
-                    del self.parent.child[op]
-                    break # Do not continue iterating on modified dictionary
+            op = self.find_op(raw=True)
+            if op: del self.parent.child[op]
+            #for op, sibling in self.parent.child.items():
+            #    if sibling is self:
+            #        del self.parent.child[op]
+            #        break # Do not continue iterating on modified dictionary
             # If parent no longer has children, make writeable again
             if RoadImage.__has_only_autoupdating_children__(self.parent) : self.parent.flags.writeable = True
-        # Disconnect self from parent
         self.parent = None
         
         
@@ -727,6 +722,21 @@ class RoadImage(np.ndarray):
                         break
         return None
     
+    def shares_data(self, parent=None):
+        """
+        Returns true if self is view on parent's data.
+        parent defaults to the immediate parent.
+        """
+        if parent is None:
+            parent = self.parent
+        if parent is None:
+            # Has no parent --> shares nothing
+            return False
+        bounds = np.byte_bounds(parent)
+        crop_bounds = np.byte_bounds(self)
+        is_inside = (crop_bounds[0]>=bounds[0]) and (crop_bounds[1]<=bounds[1])
+        return is_inside
+        
     def find_op(self, parent=None, *, raw=False, quiet=False):
         """
         Returns a tuple of tuples which describes the operations needed to make self
