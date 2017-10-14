@@ -1,5 +1,6 @@
 import functools
 import inspect
+import warnings
 
 def _tolist(t):
     if type(t) is list:
@@ -47,7 +48,7 @@ _special_hash = {
     str : lambda a: a ,  # strings are hashable
     numpy.ndarray : lambda a: (numpy.ndarray, a.shape, tuple(a.ravel())) ,
     dict : lambda d: tuple([ dict ]+[ (k, _make_hashable(d[k])) for k in sorted(d.keys()) ]) ,
-    list : lambda l: tuple([ list ]+[ _make_hashable(i) for i in l]) ,
+    list : lambda l: tuple([ _make_hashable(i) for i in l]) ,
     tuple: lambda t: tuple([ tuple]+[ _make_hashable(i) for i in t])
 }
 
@@ -64,7 +65,12 @@ def _make_hashable(a):
         except TypeError:  # unhashable type ...
             pass
     if issubclass(type(a), tuple(_special_hash.keys())):
-        return _special_hash[type(a)](a)
+        # We cannot just dereference _special_hash[type(a)] when type(a) is a true subclass
+        if type(a) in tuple(_special_hash.keys()):
+            return _special_hash[type(a)](a)
+        for cls in _special_hash.keys():
+            if issubclass(type(a), cls):
+                return _special_hash[cls](a)
     raise NotImplementedError('_make_hashable: no hashable function for type '+str(type(a)))
             
 def accepts(*types):
@@ -143,6 +149,34 @@ def strict_accepts(*types):
         return strict_accepts_wrapper
     return check_accepts
 
+def __update_parent__(self,op):
+    """
+    Internal method which updates the parent's child dictionary when a child is transformed in place.
+    Used only by generic_search.
+    """
+    ops = self.find_op(raw=True)
+    if len(ops)==1:
+        try:
+            del self.parent.child[ops]
+        except KeyError:
+            warnings.warn('Normal mode retrieval is deprecated. All ops must be stored as tuple of tuples',
+                          DeprecationWarning)
+            del self.parent.child[ops[0]]
+    elif len(ops)>1:
+        del self.parent.child[ops]
+    else:
+        # find_op returned ()
+        assert self.parent is None, 'generic_search.__update_parent__: BUG: self.parent is set, but find_op returns ().'
+        # top level RoadImage modified in place remains top level: no making-of recorded.
+        return
+    assert len(op)>0 , 'generic_search.__update_parent__: BUG: new op is ()!'
+    if not(type(op[0]) is tuple):
+        warnings.warn('Storing single op as a simple tuple is deprecated. All ops must be stored as tuple of tuples',
+                      DeprecationWarning)
+        self.parent.child[ops+(op,)] = self
+        return
+    self.parent.child[ops+op] = self
+
 def generic_search(unlocked = False):
     """
     Decorator makes an operation tuple with f and its args.
@@ -160,11 +194,12 @@ def generic_search(unlocked = False):
             # They define the order in which the tuple is built.
             # arguments have been verified by other decorators / will be verified later
             # First element of tuple is f
-            op = (f,)
+            op = [f]
             if args:
-                op += _make_hashable(args)
+                op.append(_make_hashable(args))
             if kwargs:
-                op += _make_hashable(kwargs)
+                op.append(_make_hashable(kwargs))
+            op = tuple(op)
             # Always store ops in normal form, to simplify code
             op = (op,)
             if inplace:
@@ -176,7 +211,7 @@ def generic_search(unlocked = False):
                 # The call will fail if f does not support the inplace argument
                 f(self, *args, inplace=True, **kwargs)
                 # If self has a parent, update to operation associated to self in his parent.
-                self.__update_parent__(op)
+                __update_parent__(self, op)
                 ret = self
             else:
                 # Read cache
@@ -206,7 +241,7 @@ def flatten_collection(f):
         flat = self.flatten()
         ret = f(flat, *args, **kwargs)
         # Put the collection back in the original shape
-        return ret.reshape(self.shape[:-1]+(ret.shape[3],))
+        return ret.reshape(self.shape[:-3]+ret.shape[1:])
     return flat_wrapper
     
 def varnames(f):
