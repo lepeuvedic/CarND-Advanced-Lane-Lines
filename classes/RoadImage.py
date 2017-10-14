@@ -26,182 +26,74 @@ class RoadImage(np.ndarray):
         file. If filename is None, it is the colorspace of input_array instead.  
         """
         # Default parameter values
-        # cspace
-        if cspace is None:
-            if issubclass(type(input_array),cls):
-                raise NotImplementedError('Path disabled')
-                cspace = input_array.colorspace
-            elif issubclass(type(input_array), np.ndarray):
-                if filename:
-                    raise ValueError('RoadImage: Cannot use input_array and filename together.')
-                # If input_array is given, its dimensions, dtype, nb of channels will be reused. So if it is single
-                # channel, we default to gray, three channels to RGB.
-                try:
-                    is_gray = RoadImage.is_grayscale(input_array)
-                except AssertionError:
-                    # In some rare ambiguous cases, like a 3x3 numpy array, is_grayscale will fail.
-                    # Silently assume color because the caller is certainly constructing a RoadObject 
-                    # containing a vector of 3 RGB pixels in order to remove ambiguity in future operations.
-                    is_gray = False
-
-                if is_gray:
-                    cspace = 'GRAY'
-                else:
-                    # mpimg will convert to and return an RGB image, which we keep. If the source is encoded differently
-                    # we will convert to an RGB encoded image by default.
-                    cspace = 'RGB'
-            else:
-                # Default in the case where input_array is None.
-                # Will be changed to GRAY is the file contains a single channel image (e.g. a mask)
-                cspace = 'RGB'
-
         # src_cspace
         # If filename is given, src_cspace overrides the assumption that mpimg.imread will return RGB. We assume that
         # the caller knows what is stored in the file. If it is not given and we read from a file, the assumption holds.
         if src_cspace is None:
             if filename:
-                # Will be corrected below if mpimg.imread returns a single channel image.
-                src_cspace = 'RGB'
+                # Will be set below when  mpimg.imread has read the file.
+                src_cspace = 'data'
             else:
-                raise NotImplementedError('Path disabled')
                 if issubclass(type(input_array), cls):
-                    # Try to get from input RoadImage
+                    # Get from input RoadImage
                     src_cspace = input_array.colorspace
                 else:
-                    assert issubclass(type(input_array), np.ndarray) , \
-                        'RoadImage: if supplied, input_array must be a numpy array (or a RoadImage).'
-                    # Deduce from number of channels
-                    try:
-                        is_gray = RoadImage.is_grayscale(input_array)
-                    except AssertionError:
-                        # In some rare ambiguous cases, like a 3x3 numpy array, is_grayscale will fail.
-                        # Silently assume color because the caller is certainly constructing a RoadObject 
-                        # containing a vector of 3 RGB pixels in order to remove ambiguity in future operations.
-                        is_gray = False
-                    if is_gray:
-                        src_cspace = 'GRAY'
-                    else:
-                        # Cannot guess for 2, or 4 or more channels: fail
-                        size = input_array.shape
-                        assert size[-1]==3 , ValueError('RoadImage: Cannot guess color encoding in source.')
-                        # Three channels, assume same as cspace, which may have been gotten from input_array or 
-                        # may be default value
-                        src_cspace = cspace
-                        print('Warning: RoadImage: Assuming that input color encoding is %s. Pass src_cspace explicitly to avoid this warning.' % str(cspace))
-                        
+                    # Cannot guess...
+                    raise ValueError('RoadImage: Cannot guess color encoding in source. Use src_cspace argument.')
+            
+        # cspace
+        if cspace is None:
+            if filename and not(input_array is None):
+                raise ValueError('RoadImage: Cannot use input_array and filename together.')
+            # Unless a specific conversion was requested with cspace=, do not convert source color representation.
+            cspace = src_cspace
+
         # img is the src_cspace encoded data read from a file.
         img = None
         if filename:
             # Read RGB values as float32 in range [0,1]
             img = mpimg.imread(filename)
-            if RoadImage.is_grayscale(img):
-                src_cspace = 'GRAY'
-                if input_array is None: cspace = 'GRAY'
         else:
-            img=input_array
+            img = input_array
             
-        if not(input_array is None):
-            # Input array is an already formed ndarray instance
-            # Check that number of channels is compatible with cspace
-            #try:
-            #    # image_channels fails on input_array of size (3,3).
-            #    assert RoadImage.cspace_to_nb_channels(cspace) == RoadImage.image_channels(input_array), \
-            #        'RoadImage: Conversion to %s is incompatible with number of channels in input_image.' % cspace
-            #except AssertionError:
-            #    pass
-            
-            # Automatic colorspace conversion (final RGB to 3CH is done in the final encoding)
-            if src_cspace == cspace :
-                # No conversion needed
-                pass
-            else:
-                raise NotImplementedError('Path disabled')
-                if src_cspace != 'RGB':
-                    # Convert back to RGB
-                    if RoadImage.image_channels(img) == 1:
-                        # Disregard src_cspace
-                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                    else:
-                        img = cv2.cvtColor(img, RoadImage.cspace_to_cv2_inv(src_cspace))
-                    
-                if RoadImage.cspace_to_nb_channels(cspace)==1:
-                    # Automatic conversion to grayscale if input is not grayscale.
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                    img = np.expand_dims(img,-1)  # add 1 channel in shape
-
-            # Invariant: obj and img are both RGB or grayscale
-            # Resize
-            if img.shape[:2] != input_array.shape[:2]:
-                if img.shape[0]*img.shape[1] > input_array.shape[0]*input_array.shape[1]:
-                    # Decimation
-                    method = cv2.INTER_AREA
-                else:
-                    method = cv2.INTER_CUBIC
-                img = cv2.resize(img, (input_array.shape[1],input_array.shape[0]), method)
-            # Invariant: obj and img are the same size
-            # Convert type 
-            if input_array.dtype != img.dtype:
-                # Only int8, uint8, float32 and float64 are supported
-                # int8 --> float, uint8 --> float, uint8 <--> int8
-                if img.dtype == np.uint8 or img.dtype == np.int8:
-                    if input_array.dtype == np.float32 or input_array.dtype == np.float64:
-                        m = np.max(img)
-                        img = img.astype(input_array.dtype)
-                        if m > 1 or (issubclass(type(img), RoadImage) and img.binary==False):
-                            # If image is not a binary mask, scale pixel values to [0., 1.]
-                            img /= 255.
-                    elif input_array.dtype == np.int8:
-                        # uint8 to int8 : Scale to 0..127
-                        img = (img//2).astype(np.int8)
-                    elif input_array.dtype == np.uint8:
-                        # int8 to uint8 : Check non negative, then scale
-                        assert np.min(img) >= 0 , ValueError('RoadImage: Image has negative values: cannot convert to uint8.')
-                        img = (img.astype(np.uint8))*2
-                    else:
-                        raise ValueError('RoadImage: image dtype %s is not supported.' % str(input_array.dtype))
-                # Float --> int8, float --> uint8. 
-                # We have signed gradient data in [-1;1] and unsigned image data in [0;1]
-                elif img.dtype == np.float32 or img.dtype == np.float64:
-                    assert np.max(img) <= 1.0, ValueError('RoadImage: Image data out of range. Automatic conversion is not possible.')            # Automatic conversion from 3ch to another 3ch color representation
-
-                    if input_array.dtype == np.uint8:
-                        assert np.min(img) >= 0.0 , ValueError('RoadImage: Image has negative values: cannot convert to uint8.')
-                        img = np.around(img * 255.0).astype(np.uint8)
-                    elif input_array.dtype == np.int8:
-                        assert np.min(img) >= -1.0 , ValueError('RoadImage: Image data out of [-1;1] range. Automatic conversion is not possible')
-                        img = np.around(img * 127.0).astype(np.int8)
-                    elif input_array.dtype == np.float32 or input_array.dtype == np.float64:
-                        img = img.astype(input_array.dtype)
-                    else:
-                        raise ValueError('RoadImage: image dtype %s is not supported.' % str(input_array.dtype))
-                        
-            # Even if input_array is a RoadImage, view returns a new instance and calls __array_finalize__ with obj=ndarray.
-            obj = np.ndarray(shape=img.shape, dtype=img.dtype, buffer=img).view(cls)
-        else:
-            # Convert numpy image to RoadImage
-            assert not(img is None) , 'RoadImage: Either input_array or filename must be passed to constructor.'
-            # Normalize shape
-            if cspace == 'GRAY' and img.shape[-1] != 1:
-                img = np.expand_dims(img,-1)
-            # Create instance and call __array_finalize__ with obj=img
-            obj = img.view(cls)
-        #print('new instance created')
+        if img is None:
+            raise ValueError('RoadImage: Either input_array or filename must be passed to constructor.')
         
-        # Change colorspace (from 3 channel to 3 channel only: convert to Gray has already been done)
-        # Set colorspace and binarity
-        cv2_nbch = RoadImage.cspace_to_nb_channels(cspace)
-        if cv2_nbch == 3:
-            obj.colorspace = cspace
+        # Invariant: img is an instance of np.ndarray or a derivative class (such as RoadImage)
+        
+        if RoadImage.is_grayscale(img):
+            # No immediate conversion in ctor for grayscale images
+            # Correct defaults
+            if src_cspace == 'data': src_cspace = 'GRAY'
+            if cspace == 'data':     cspace = 'GRAY'
+            # Normalize shape
+            if img.shape[-1] != 1:
+                img = np.expand_dims(img,-1)
+        else:
+            if src_cspace == 'data': src_cspace = 'RGB'
+            if cspace == 'data':     cspace = 'RGB'
+            
+        if src_cspace != cspace and (src_cspace != 'RGB' or cspace == 'GRAY'):
+            # Not 'RGB' nor cspace: fail because we won't do two convert_color 
+            raise ValueError('RoadImage: Cannot autoconvert from '+str(src_cspace)+' to '+str(cspace)+' in ctor.')
+
+        # Invariant: (src_cspace == 'RGB' and cspace != 'GRAY') or src_cspace == cspace
+
+        # Change colorspace (from 3 channel to 3 channel only)
+        if cspace != src_cspace:
+            # Invariant: src_cspace == 'RGB' and cspace != 'GRAY'
+            cv2_nbch = RoadImage.cspace_to_nb_channels(cspace)
+            assert cv2_nbch == 3, 'RoadImage: BUG: Check number of channels for cspace '+cspace+" in CSPACES"
             cv2_code = RoadImage.cspace_to_cv2(cspace)  # Returns None for cspace='RGB' since we are already in RGB.
             if cv2_code:
-                #raise NotImplementedError('Path disabled')
-                cv2.cvtColor(obj, cv2_code, obj)
-            obj.binary = False
-        elif cv2_nbch == 1:
-            obj.colorspace = 'GRAY'
-        else:
-            # Number of channels is neither 3 nor 1.
-            obj.colorspace = None
+                cv2.cvtColor(img, cv2_code, img)  # in place color conversion
+
+        # Create instance and call __array_finalize__ with obj=img
+        # __array_finalize__ declares the new attributes of the class
+        obj = img.view(cls)
+        
+        # Set colorspace (for new instances, __array_finalize__ gets a default value of 'RGB')
+        obj.colorspace = cspace
  
         # Set filename
         if filename: obj.filename = filename
@@ -209,18 +101,24 @@ class RoadImage(np.ndarray):
         return obj
 
     def __array_finalize__(self, obj):
-        # ``self`` is a new object resulting from
-        # ndarray.__new__(InfoArray, ...), therefore it only has
+        # When called from __new__,
+        # ``self`` is a new object resulting from ndarray.__new__(RoadImage, ...), therefore it only has
         # attributes that the ndarray.__new__ constructor gave it -
         # i.e. those of a standard ndarray.
         #
+        # In other cases, it is called directly from the constructor of ndarray, when calling .view(RoadImage).
+        #
         # Add attributes with default values, or inherited values
         
-        # Cropping and crop_parent:
-        # A cropped area is an ndarray slice. It shares the same data, and a slice can be used to modifiy the original data.
-        # crop_area and crop_parent are computed when a slice is made, and otherwise are inherited across operations which do
-        # not change the width or depth. When a cropping is cropped again, a chain is created. A method get_crop(self,parent)
-        # computes the crop area relative to the given parent. A method crop_parents(self) iterates along the chain.
+        # Cropping:
+        # A cropped area is an ndarray slice. They shares the same data, therefore a slice can be used
+        # to modifiy the original data.
+        # crop_area is computed when a slice is made, and otherwise is None
+        # not change the width or depth. When a cropping is cropped again, a chain is created.
+
+        # A method get_crop(self,parent) computes the crop area relative to the given parent.
+        # A method crop_parents(self) iterates along the chain.
+        
         self.crop_area   = None           # A tuple of coordinates ((x1,y1),(x2,y2))
         
         # The parent image from which this image was made.
@@ -247,9 +145,9 @@ class RoadImage(np.ndarray):
             self.binary = False
             
         # By default inherited
-        self.colorspace = getattr(obj, 'colorspace', 'RGB')   # Colorspace info: inherited, set by __new__ for new instances
-        self.gradient = getattr(obj, 'gradient', False)       # True for a gradient image: inherited, set by gradient method
-        self.filename = getattr(obj, 'filename', None)       # filename is inherited
+        self.colorspace = getattr(obj, 'colorspace', 'RGB')   # inherited, set by __new__ for new instances
+        self.gradient = getattr(obj, 'gradient', False)       # True for a gradient image: inherited
+        self.filename = getattr(obj, 'filename', None)        # filename is inherited
         
         # We could have got to the ndarray.__new__ call in 3 ways:
         # From an explicit constructor - e.g. InfoArray():
@@ -302,8 +200,7 @@ class RoadImage(np.ndarray):
                     coords2.append(w+1)
                 assert byte_offset == 0, 'RoadImage:__array_finalize__ BUG: crop_area 2 computation: item_offset != 0.'
                 crop_area = (tuple(coords1),tuple(coords2))
-                #print(crop_area)
-
+        
                 # We have the n-dimensional crop_area... and we store the last three dimensions.
                 self.crop_area = (tuple(coords1[-3:]),tuple(coords2[-3:]))
                 
@@ -508,7 +405,8 @@ class RoadImage(np.ndarray):
             return img.colorspace == 'GRAY'
             
         # In other cases it depends on the shape and number of channels
-        assert issubclass(type(img), np.ndarray), 'is_grayscale: img must be a numpy array or an instance of a derivative class.'
+        if not( issubclass(type(img), np.ndarray) ):
+            raise ValueError('is_grayscale: img must be a numpy array or an instance of a derivative class.')
         size = img.shape
 
         if size[-1] == 3: return False  # It can be color specification if len(size)==1, or a vector of color pixels.
