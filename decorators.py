@@ -204,7 +204,6 @@ def generic_search(unlocked = False):
             op = (op,)
             if inplace:
                 # In-place operation is only allowed when there are no children
-                print(f.__name__,'in place')
                 if self.child:
                     raise ValueError('RoadImage.'+f.__name__+
                                      ': in-place operation is only allowed when there is no child.')

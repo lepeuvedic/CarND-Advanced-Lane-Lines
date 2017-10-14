@@ -316,17 +316,20 @@ class RoadImage(np.ndarray):
     
     @classmethod
     def cspace_to_cv2(cls, cspace):
-        assert cspace in cls.CSPACES.keys(), 'cspace_to_cv2: Unsupported color space %s' % str(cspace)
+        if not(cspace in cls.CSPACES.keys()):
+            raise ValueError('cspace_to_cv2: Unsupported color space %s' % str(cspace))
         return cls.CSPACES[cspace][0]
         
     @classmethod
     def cspace_to_cv2_inv(cls, cspace):
-        assert cspace in cls.CSPACES.keys(), 'cspace_to_cv2: Unsupported color space %s' % str(cspace)
+        if not(cspace in cls.CSPACES.keys()):
+            raise ValueError('cspace_to_cv2: Unsupported color space %s' % str(cspace))
         return cls.CSPACES[cspace][1]
 
     @classmethod
     def cspace_to_nb_channels(cls, cspace):
-        assert cspace in cls.CSPACES.keys(), 'cspace_to_cv2: Unsupported color space %s' % str(cspace)
+        if not(cspace in cls.CSPACES.keys()):
+            raise ValueError('cspace_to_cv2: Unsupported color space %s' % str(cspace))
         return cls.CSPACES[cspace][2]
 
     @classmethod
@@ -337,8 +340,8 @@ class RoadImage(np.ndarray):
         The function assumes a table of images if img is 4D.
         If the last dimension is length 1 or 3, a single pixel (color value), a vector of pixels or an image is assumed.
         """
-        assert issubclass(type(img), np.ndarray) , \
-                'image_channels: img must be a numpy array or an instance of a derivative class.'
+        if not(issubclass(type(img), np.ndarray)):
+            raise TypeError('image_channels: img must be a numpy array or an instance of a derivative class.')
         if issubclass(type(img), RoadImage):
             # It is always a single image
             if RoadImage.is_grayscale(img): return 1
@@ -346,7 +349,9 @@ class RoadImage(np.ndarray):
         size = img.shape
         if len(size)==4: return size[-1]
         # Cannot say for 3x3 kernel
-        assert size != (3,3) , 'image_channels: 3-by-3 numpy array can be either a small kernel or a vector of 3 color pixels. Store kernel as (3,3,1) and vector as RoadImage to remove ambiguity.'
+        if size == (3,3):
+            raise ValueError('image_channels: 3-by-3 numpy array can be either a small kernel or a vector '
+                             +'of 3 color pixels. Store kernel as (3,3,1) and vector as RoadImage to remove ambiguity.')
         if size[-1] == 1 or size[-1] == 3: return size[-1]
         if len(size) == 1 or len(size) == 2: return 1
         raise ValueError('image_channels: Cannot guess which dimension, if any, is the number of channels in shape %s.' 
@@ -357,8 +362,8 @@ class RoadImage(np.ndarray):
         """
         Adds singleton dimensions to shape to make it generalize to the reference shape ret.
         """
-        assert issubclass(type(shape),tuple), 'RoadImage.__match_shape__: shape must be a tuple.'
-        assert issubclass(type(ref),tuple), 'RoadImage.__match_shape__: ref must be a tuple.'
+        assert issubclass(type(shape),tuple), 'RoadImage.__match_shape__: BUG: shape must be a tuple.'
+        assert issubclass(type(ref),tuple), 'RoadImage.__match_shape__: BUG: ref must be a tuple.'
         out = [1]*len(ref)
         if shape == (1,):
             # Scalar case
@@ -381,7 +386,7 @@ class RoadImage(np.ndarray):
             out = list(ref)
         else:
             # Anything that generalizes to shape
-            assert len(shape) == len(ref), \
+            assert shape.ndim == ref.ndim, \
                 'RoadImage.threshold: min must be a documented form or have the same number of dimensions as self.'
             out = list(shape)
             ref_list = list(ref)
@@ -467,10 +472,11 @@ class RoadImage(np.ndarray):
         The function also returns a list of indices, the same length as lst, which associates each element of lst
         with one ancestor.
         """
-        assert  len(lst)>0 , 'RoadImage.make_collection: Called with an empty list.'
+        if len(lst)==0:
+            raise ValueError('RoadImage.make_collection: lst must not be an empty list.')
         for i,img in enumerate(lst):
-            assert issubclass(type(img),RoadImage), \
-                'RoadImage.make_collection: List elements must be type RoadImage. Check element %s.' % str(i)
+            if not(issubclass(type(img),RoadImage)):
+                raise TypeError('RoadImage.make_collection: List elements must be type RoadImage. Check element %d.'% i)
         return RoadImage.__find_common_ancestor__(lst)
     
     @classmethod
@@ -541,7 +547,8 @@ class RoadImage(np.ndarray):
         NB: This implementation only validates that all collections in lst have the same dtype.
         NB: The resulting collection has no parent.
         """
-        assert  len(lst)>0 , 'RoadImage.make_collection: Called with an empty list.'
+        if len(lst)==0:
+            raise ValueError('RoadImage.make_collection: List lst must not be an empty list.')
         for i,img in enumerate(lst):
             if not( issubclass(type(img),RoadImage) ):
                 raise ValueError('RoadImage.make_collection: List elements must be type RoadImage. Check element %d.'% i)
@@ -550,20 +557,24 @@ class RoadImage(np.ndarray):
         assert len(lst[0].shape) >= 3, 'RoadImage.make_collection: BUG: Found RoadImage with less then 3 dims in lst.'
         shape_coll = lst[0].shape[:-3]
         for i, img in enumerate(lst):
-            assert img.shape[:-3] == shape_coll, \
-            'RoadImage.make_collection: List elements must have the same collection structure. Check element %s.' % str(i)
+            if img.shape[:-3] != shape_coll:
+                raise ValueError('RoadImage.make_collection: List elements must have the same collection structure. '+
+                                 'Check element %d.' % i)
         # Future implementation will cast dtype intelligently. Current one requires same dtype.
         # Future implementation will handle 'channel' op. Current one requires same number of channels
         nb_ch = RoadImage.image_channels(lst[0])
         for i,img in enumerate(lst):
-            assert img.dtype == dtype, \
-                'RoadImage.make_collection: List elements must share the same dtype. Check element %s.' % str(i)
-            assert RoadImage.image_channels(img) == nb_ch, \
-             'RoadImage.make_collection: List elements must have the same number of channels. Check element %s.' % str(i)
+            if img.dtype != dtype:
+                raise ValueError('RoadImage.make_collection: List elements must share the same dtype. '+
+                                 'Check element %d.' % i)
+            if RoadImage.image_channels(img) != nb_ch:
+                raise ValueError('RoadImage.make_collection: List elements must have the same number of channels. '+
+                                 'Check element %d.' % i)
 
         ancestors, index = RoadImage.__find_common_ancestor__(lst)
         # Future implementation will manage several ancestors
-        assert len(ancestors) == 1, 'RoadImage.make_collection: List elements must have the same ancestor.'
+        if len(ancestors) > 1:
+            raise ValueError('RoadImage.make_collection: List elements must have the same ancestor.')
 
         crop_area = lst[0].get_crop(ancestors[index[0]])
         ref_ops = lst[0].find_op(ancestors[index[0]], raw=False)
@@ -575,12 +586,14 @@ class RoadImage(np.ndarray):
             # We only need to cater about resize, warp and crop ops
             # All images must have the same crop versus ancestor
             msg = 'RoadImage.make_collection: List elements must show the same crop area {0}. Check element {1}'
-            assert img.get_crop(ancestors[index[i]]) == crop_area, msg.format(str(crop_area) , str(i))
+            if img.get_crop(ancestors[index[i]]) != crop_area:
+                raise ValueError(msg.format(str(crop_area) , str(i)))
             # All images must have identical warp operations in the same relative order with crop operations
             # Find sequence of operations from common ancestor to list element
             ops = RoadImage.select_ops(img.find_op(ancestors[index[i]], raw=False), KEY_OPS)
-            assert ops == ref_ops, \
-                'RoadImage.make_collection: List elements must have the same sequence of crops, warps and resizes.'
+            if ops != ref_ops:
+                raise ValueError('RoadImage.make_collection: '+
+                                 'List elements must have the same sequence of crops, warps and resizes.')
             
         # All is ok
         # Stack all the elements of lst. stack make a new copy in memory.
@@ -635,7 +648,8 @@ class RoadImage(np.ndarray):
         In case of crop of crop, the crop_area variable only contains the crop relative to the immediate parent.
         This utility method computes the crop area relative to any parent.
         """
-        assert self.ndim >=3, ValueError('RoadImage.get_crop: image must have shape (height,width,channels).')
+        if self.ndim <3:
+            raise ValueError('RoadImage.get_crop: image must have shape (height,width,channels).')
         p = self
         x1 = 0
         y1 = 0
@@ -765,9 +779,7 @@ class RoadImage(np.ndarray):
 
         # local search in self.parent.child
         for op,img in self.parent.child.items():
-            if not(issubclass(type(op[0]), tuple)):
-                warnings.warn('RoadImage.find_op: Found non normal form op %s' % str(op), DeprecationWarning)
-                op = (op,)
+            assert issubclass(type(op[0]), tuple), 'RoadImage.find_op: BUG: Invalid operation %s' % repr(op)
             if img is self:
                 if not(raw):
                     # Replace method by method name in op
@@ -822,7 +834,8 @@ class RoadImage(np.ndarray):
         if not(nb_ch in [1,3,4]):
             raise ValueError('RoadImage.show: Can only save single channel, RGB or RGBA images.')
         flat = self.flatten()
-        assert flat.shape[0] == 1, 'RoadImage.show: Can only save single images.'
+        if flat.shape[0] != 1:
+            raise ValueError('RoadImage.show: Can only save single images.')
         mpimg.imsave(filename, flat[0], format=format)
 
     __red_green_cmap__ = None
@@ -841,7 +854,8 @@ class RoadImage(np.ndarray):
         if not(nb_ch in [1, 3, 4]):
             raise ValueError('RoadImage.show: Can only display single channel, RGB or RGBA images.')
         flat = self.flatten()
-        assert flat.shape[0] == 1, 'RoadImage.show: Can only display single images.'
+        if flat.shape[0] != 1:
+            raise ValueError('RoadImage.show: Can only display single images.')
 
         if self.gradient:
             # Specific displays for gradients
@@ -898,16 +912,18 @@ class RoadImage(np.ndarray):
         In flattened form, shape is (nb_images,height,width,channels).
         This operation is always performed in place, without copying the data.
         """
-        # Even en empty numpy array has one dimension of length zero
-        assert self.shape[-1] == RoadImage.image_channels(self), 'RoadImage.flatten: last dimension must be channels.'
+        # Even an empty numpy array has one dimension of length zero
+        assert self.shape[-1] == RoadImage.image_channels(self),\
+            'RoadImage.flatten: BUG: last dimension must be channels. Shape is %s.' % repr(self.shape)
 
         # Test if already flat
         if self.ndim == 4:
             return self
             
-        assert len(self.shape) >= 3, 'RoadImage.flatten: RoadImage shape must be (height,width,channels).'
+        if self.ndim < 3:
+            raise ValueError('RoadImage.flatten: RoadImage shape must be (height,width,channels).')
         
-        if len(self.shape) > 3:
+        if self.ndim > 3:
             # Flatten multiple dimensions before last three
             nb_img = np.prod(np.array(list(self.shape[:-3])))
             # np.prod is well-behaved, but will return a float (1.0) if array is empty
@@ -915,7 +931,7 @@ class RoadImage(np.ndarray):
             nb_img = 1
         ret = self.reshape((nb_img,)+self.shape[-3:])
 
-        assert not(ret.crop_area is None) , 'BUG no crop area'
+        assert not(ret.crop_area is None) , 'RoadImage.flatten: BUG: No crop area'
         return ret
         
     def channel(self,n):
@@ -1024,11 +1040,14 @@ class RoadImage(np.ndarray):
             return self
 
         # Expensive input tests
-        assert np.max(self) <= 1.0 , 'RoadImage.to_int: maximum value of input is greater than one.'
+        if np.max(self) > 1.0:
+            raise ValueError('RoadImage.to_int: maximum value of input is greater than one.')
         if self.gradient:
-            assert np.min(self) >= -1.0 , 'RoadImage.to_int: minimum value of input is less than minus one.'
+            if np.min(self) < -1.0:
+                raise ValueError('RoadImage.to_int: minimum value of input is less than minus one.')
         else:
-            assert np.min(self) >= 0. , 'RoadImage.to_int: minimum value of input is less than zero.'
+            if np.min(self) < 0.:
+                raise ValueError('RoadImage.to_int: minimum value of input is less than zero.')
 
         if self.gradient:
             ret = np.empty_like(self, dtype=np.int8)
@@ -1301,7 +1320,8 @@ class RoadImage(np.ndarray):
             peak[np.nonzero(peak==0.0)]=1  # do not scale black lines
             scalef = 127.0/peak
         else:
-            assert self.dtype == np.uint8, 'RoadImage.normalize: image dtype must be int8, uint8, float32 or float64.'
+            if self.dtype != np.uint8:
+                raise ValueError('RoadImage.normalize: image dtype must be int8, uint8, float32 or float64.')
             if ((peak==255) | (peak==0)).all():
                 already_normalized = True
             peak[np.nonzero(peak==0.0)]=1  # do not scale black lines
@@ -1353,10 +1373,6 @@ class RoadImage(np.ndarray):
         if (mini is None) and (maxi is None):
             raise ValueError('RoadImage.treshold: Specify mini=, maxi= or both.')
         
-        if inplace:
-            # in place conversion allowed only when no children exist
-            assert not(self.child) , 'RoadImage.threshold: in place conversion is only allowed when there is no child.'
-
         # Ensure mini and maxi are iterables, even when supplied as scalars
         if issubclass(type(mini),float) or issubclass(type(mini),int):
             mini = np.array([mini], dtype=np.float32)
@@ -1365,27 +1381,29 @@ class RoadImage(np.ndarray):
 
         # Scale, cast and reshape mini according to self.dtype
         if not(mini is None):
-            assert np.all((mini >= 0.0) & (mini <= 1.0)) , 'RoadImage.threshold: Arg mini must be between 0.0 and 1.0 .'
+            if np.any((mini < 0.0) | (mini > 1.0)):
+                raise ValueError('RoadImage.threshold: Arg mini must be between 0.0 and 1.0 .')
             if self.dtype == np.int8:
                 mini = np.round(mini*127.).astype(np.int8)
             elif self.dtype == np.uint8:
                 mini = np.round(mini*255.).astype(np.uint8)
             else:
-                assert self.dtype == np.float32 or self.dtype == np.float64 ,\
-                'RoadImage.normalize: image dtype must be int8, uint8, float32 or float64.'
+                if self.dtype != np.float32 and self.dtype != np.float64:
+                    raise ValueError('RoadImage.threshold: image dtype must be int8, uint8, float32 or float64.')
             mini_shape = RoadImage.__match_shape__(mini.shape, self.shape)
             mini = mini.reshape(mini_shape)
 
         # Scale, cast and reshape maxi according to self.dtype
         if not(maxi is None):
-            assert np.all((maxi >= 0.0) & (maxi <= 1.0)) , 'RoadImage.threshold: Arg maxi must be between 0.0 and 1.0 .'
+            if np.any((maxi < 0.0) | (maxi > 1.0)):
+                raise ValueError('RoadImage.threshold: Arg maxi must be between 0.0 and 1.0 .')
             if self.dtype == np.int8:
                 maxi = np.round(maxi*127.).astype(np.int8)
             elif self.dtype == np.uint8:
                 maxi = np.round(maxi*255.).astype(np.uint8)
             else:
-                assert self.dtype == np.float32 or self.dtype == np.float64, \
-                    'RoadImage.threshold: Supported dtypes for self are: int8, uint8, float32 and float64.'
+                if self.dtype != np.float32 and self.dtype != np.float64:
+                    raise ValueError('RoadImage.threshold: image dtype must be int8, uint8, float32 and float64.')
             maxi_shape = RoadImage.__match_shape__(maxi.shape, self.shape)
             maxi = maxi.reshape(maxi_shape)
 
@@ -1459,5 +1477,5 @@ class RoadImage(np.ndarray):
         """
     # List of operations which update automatically when the parent RoadImage is modified.
     # Currently this is only supported for operations implemented as numpy views.
-    AUTOUPDATE = [ 'flatten', 'crop', 'channels', '__slice__' ]
+    AUTOUPDATE = [ 'flatten', 'crop', 'channels', 'ravel', '__slice__' ]
     
