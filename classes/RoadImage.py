@@ -371,11 +371,11 @@ class RoadImage(np.ndarray):
         elif shape == (ref[-1],):
             # Per channel thresholds
             out[-1] = ref[-1]
-        elif shape == (ref[-3], ref[-2]):
+        elif shape == (ref[-3], ref[-2]) or shape == (1,) + (ref[-3], ref[-2]):
             # Per pixel thresholds, same for all channels
             out[-3] = ref[-3]
             out[-2] = ref[-2]
-        elif shape == ref[-3:]:
+        elif shape == ref[-3:] or shape == (1,) + ref[-3:]:
             # Per pixel thresholds, different for each channel
             out[-3] = ref[-3]
             out[-2] = ref[-2]
@@ -386,7 +386,7 @@ class RoadImage(np.ndarray):
             out = list(ref)
         else:
             # Anything that generalizes to shape
-            assert shape.ndim == ref.ndim, \
+            assert len(shape) == len(ref), \
                 'RoadImage.threshold: min must be a documented form or have the same number of dimensions as self.'
             out = list(shape)
             ref_list = list(ref)
@@ -433,7 +433,7 @@ class RoadImage(np.ndarray):
         # extract unique ancestors, not necessarily the youngest ones
         ancestors = []
         for i,lineage in enumerate(ancestry):
-            # NB: if lineage[0] in ancestors fails since in seems to get distributed over the numpy array
+            # NB: "if lineage[0] in ancestors" fails since in seems to get distributed over the numpy array
             if any(lineage[0] is anc for anc in ancestors):
                 out_index[i] = ancestors.index(lineage[0])
             else:
@@ -455,8 +455,10 @@ class RoadImage(np.ndarray):
                 # Descend ancestries as long as ancestors are identical
                 i = 0
                 equal = True
+                last = min(len(ref_anc),len(lineage))  # Minimum value is 1.
                 while equal:
                     i += 1
+                    if i==last: break  # ref_anc and lineage are direct line ancestors
                     for lineage in family_ancestry[1:]:
                         equal = (equal and (lineage[i] is ref_anc[i])) 
                 out_ancestors.append(ref_anc[i-1])
@@ -473,10 +475,11 @@ class RoadImage(np.ndarray):
         with one ancestor.
         """
         if len(lst)==0:
-            raise ValueError('RoadImage.make_collection: lst must not be an empty list.')
+            raise ValueError('RoadImage.find_common_ancestor: lst must not be an empty list.')
         for i,img in enumerate(lst):
             if not(issubclass(type(img),RoadImage)):
-                raise TypeError('RoadImage.make_collection: List elements must be type RoadImage. Check element %d.'% i)
+                raise TypeError('RoadImage.find_common_ancestor: List elements must be type RoadImage. Check element %d.'
+                                % i)
         return RoadImage.__find_common_ancestor__(lst)
     
     @classmethod
@@ -495,13 +498,36 @@ class RoadImage(np.ndarray):
         return ret
     
     @classmethod
-    def pretty_print_ops(cls, ops, trim=100):
+    def pretty_print_ops(cls, ops, trim=200):
         """
         Takes an ops key stored in the child attribute of any image, and returns a nice string representation.
         """
-        def to_string(a):
+        def get_size(t, trim):
+            """
+            Returns the total size of t, unless it is larger than trim, in which case a value
+            larger than trim, but probably much smaller than the real size of t, is returned.
+            """
             from sys import getsizeof
-            if getsizeof(a) > trim:
+            # getsizeof does not give the total size of dicts, tuples or lists
+            sz = 0
+            if issubclass(type(t),dict):
+                for key,val in t.items():
+                    sz += get_size(val, trim)
+                    if sz > trim: return sz
+                    sz += get_size(key, trim)
+                    if sz > trim: return sz
+
+            elif issubclass(type(t),(tuple,list)):
+                for e in t:
+                    sz += get_size(e, trim)
+                    if sz > trim: return sz
+
+            else:
+                sz = getsizeof(t)
+            return sz
+
+        def to_string(a):
+            if get_size(a, trim) > trim:
                 return '...hash(' + str(hash(a)) + ')...'
             return repr(a)
         
@@ -512,20 +538,29 @@ class RoadImage(np.ndarray):
             for op in ops:
                 # Process each op: there are at most three
                 # (f, args, kwargs), where args and kwargs are optional and kwargs is a dict
-                pretty_op=[ op[0].__name__ ]
-                for a in op[1:]:
-                    if not(type(a) is tuple and len(a)>0):
-                        raise ValueError('RoadImage.pretty_print_ops: Invalid operation format: '+str(a))
-                    if a[0] is dict:
-                        # named arguments kwargs
-                        for param in a[1:]:
-                            if not(len(param)==2):
-                                raise ValueError('RoadImage.pretty_print_ops: Invalid named parameter format.')
-                            pretty_op.append(str(param[0])+'='+to_string(param[1]))
-                    else:
-                        # positional arguments (will always be first)
-                        for param in a:
-                            pretty_op.append(to_string(param))
+                if not(issubclass(type(op[0]),str)):
+                    # It is either a function handle or a str
+                    pretty_op=[ op[0].__name__ ]
+                else:
+                    pretty_op=[ op[0] ]
+                if pretty_op[0] == RoadImage.make_collection.__name__:
+                    # Special case because arguments are ops
+                    for a in op[1:]:
+                        pretty_op.append(RoadImage.pretty_print_ops(a, trim=trim))
+                else:
+                    for a in op[1:]:
+                        if not(type(a) is tuple and len(a)>0):
+                            raise ValueError('RoadImage.pretty_print_ops: Invalid operation format: '+str(a))
+                        if a[0] is dict:
+                            # named arguments kwargs
+                            for param in a[1:]:
+                                if not(len(param)==2):
+                                    raise ValueError('RoadImage.pretty_print_ops: Invalid named parameter format.')
+                                pretty_op.append(str(param[0])+'='+to_string(param[1]))
+                        else:
+                            # positional arguments (will always be first)
+                            for param in a:
+                                pretty_op.append(to_string(param))
                 pretty_op = '( ' + ", ".join(pretty_op) + ' )'
                 out.append(pretty_op)
             out = '(' + ", ".join(out) + ')'
@@ -533,11 +568,12 @@ class RoadImage(np.ndarray):
         return '()'
             
     @classmethod
-    def make_collection(cls, lst, size=None, dtype=None):
+    def make_collection(cls, lst, size=None, dtype=None, concat=False):
         """
         Takes a list of RoadImage objects and returns a collection.
         It also accepts a list of collections, but they must have the same structure. In this case, a one dimension
-        higher collection is returned.
+        higher collection is returned, unless concat is True, in which case make_collection accepts collections
+        having axis 0 of different lengths (they are concatenated along axis 0).
         Images are resized/uncropped to fit the given size, or the shape of a common parent if any.
         If channels were extracted, and some elements of lst are multi-channel, the result will be multi-channel
         with single channel elements placed at the right position and padded with zeroed channels.
@@ -556,10 +592,13 @@ class RoadImage(np.ndarray):
             dtype = lst[0].dtype
         assert len(lst[0].shape) >= 3, 'RoadImage.make_collection: BUG: Found RoadImage with less then 3 dims in lst.'
         shape_coll = lst[0].shape[:-3]
+        if concat and len(shape_coll)==0:
+            raise ValueError('RoadImage.make_collection: elements must be collections to use concat=True.')
         for i, img in enumerate(lst):
             if img.shape[:-3] != shape_coll:
-                raise ValueError('RoadImage.make_collection: List elements must have the same collection structure. '+
-                                 'Check element %d.' % i)
+                if not(concat) or img.shape[1:-3] != shape_coll[1:]:
+                    raise ValueError('RoadImage.make_collection: List elements must have the same collection structure. '
+                                     + 'Check element %d.' % i)
         # Future implementation will cast dtype intelligently. Current one requires same dtype.
         # Future implementation will handle 'channel' op. Current one requires same number of channels
         nb_ch = RoadImage.image_channels(lst[0])
@@ -574,7 +613,14 @@ class RoadImage(np.ndarray):
         ancestors, index = RoadImage.__find_common_ancestor__(lst)
         # Future implementation will manage several ancestors
         if len(ancestors) > 1:
-            raise ValueError('RoadImage.make_collection: List elements must have the same ancestor.')
+            # Make collection and copy cut the link to the ancestor, so it may not be abnormal
+            # TODO: link the collection to the common ancestor, with as parameters, all the required operations.
+            warnings.warn('RoadImage.make_collection: cannot be sure that all the elements have the same ancestor.',
+                          RuntimeWarning)
+            # All ancestors must have the same size
+            for anc in ancestors[1:]:
+                if anc.get_size() != ancestors[0].get_size():
+                    raise ValueError('RoadImage.make_collection: List elements must have the same ancestor.')
 
         crop_area = lst[0].get_crop(ancestors[index[0]])
         ref_ops = lst[0].find_op(ancestors[index[0]], raw=False)
@@ -597,7 +643,10 @@ class RoadImage(np.ndarray):
             
         # All is ok
         # Stack all the elements of lst. stack make a new copy in memory.
-        coll = np.stack(lst, axis=0).view(RoadImage)
+        if concat:
+            coll = np.concatenate(lst, axis=0).view(RoadImage)
+        else:
+            coll = np.stack(lst, axis=0).view(RoadImage)
         coll.gradient = all([img.gradient for img in lst])
         coll.binary = all([img.binary for img in lst])
         coll.colorspace = lst[0].colorspace
@@ -608,6 +657,15 @@ class RoadImage(np.ndarray):
         if any([img.filename != coll.filename for img in lst]): coll.filename = None
         # No parent, because make_collection is not an operation on a single image
         coll.parent = None
+        # If we have a single ancestor, add the collection as descendant
+        # TODO: try to reuse existing recorded collections...
+        if len(ancestors)==1:
+            oplst = [ img.find_op(ancestors[index[i]], raw=True) for i, img in enumerate(lst) ]
+            op = ( tuple([RoadImage.make_collection] + oplst + [ ( dict , ('concat', concat)) ] ), )
+            ancestors[0].__add_child__(coll, op)
+        else:
+            warnings.warn('RoadImage.make_collection: Cannot link to parent when there are %d ancestors.'
+                          % len(ancestors), RuntimeWarning)
         return coll
     
     def get_size(self):
@@ -777,13 +835,24 @@ class RoadImage(np.ndarray):
         else:
             ops = ()
 
+        def substitute_name(longop):
+            ret = []
+            for op in longop:
+                name = op[0].__name__
+                if name == RoadImage.make_collection.__name__:
+                    # Other args are ops too, except the last which encodes concat=T/F
+                    ret.append((name,)+tuple([substitute_name(arg) for arg in op[1:-1]])+op[-1:])
+                else:        
+                    ret.append((name,)+op[1:])
+            return tuple(ret)
+        
         # local search in self.parent.child
         for op,img in self.parent.child.items():
             assert issubclass(type(op[0]), tuple), 'RoadImage.find_op: BUG: Invalid operation %s' % repr(op)
             if img is self:
                 if not(raw):
                     # Replace method by method name in op
-                    op = tuple([ (o[0].__name__,)+o[1:] for o in op])
+                    op = substitute_name(op)
                 return ops+op
         if quiet:
             return ()
@@ -841,7 +910,7 @@ class RoadImage(np.ndarray):
     __red_green_cmap__ = None
 
     @strict_accepts(object, Axes, (str,None,Colormap), bool)  
-    def show(self, axis, cmap=None, *, alpha=True):
+    def show(self, axis, *, cmap=None, alpha=True, title=None):
         """
         Display image using matplotlib.pyplot.
         cmap is a colormap from matplotlib library. It is used only for single channel images and sensible defaults
@@ -887,6 +956,8 @@ class RoadImage(np.ndarray):
                 else:
                     img = flat[0,:,:,0:3].to_float()
                 axis.imshow(img)
+        if title:
+            axis.set_title(title, fontsize=30)
                 
     # Deep copy
     def copy(self):
@@ -959,6 +1030,8 @@ class RoadImage(np.ndarray):
         ret = self[:,:,:,n:m]  # Main operation
         if n>0 or m<3:
             ret.colorspace = None
+        ret.gradient = self.gradient
+        ret.binary = self.binary
         return ret
 
     def rgb(self):
@@ -1061,6 +1134,8 @@ class RoadImage(np.ndarray):
         else:
             ret[:] = np.round(self * scaling) #.astype(np.int8)
 
+        ret.binary = self.binary
+        ret.gradient = self.gradient
         return ret
 
     @generic_search()
@@ -1091,7 +1166,8 @@ class RoadImage(np.ndarray):
             ret[:] = self #.astype(np.float32)
         else:
             ret[:] = scaling * self #.astype(np.float32)
-
+        ret.binary = self.binary
+        ret.gradient = self.gradient
         return ret
 
     # Remove camera distortion
@@ -1174,6 +1250,9 @@ class RoadImage(np.ndarray):
         # Accept a single task in tasks (as a string)
         if type(tasks) is str:
             tasks = [ tasks ]
+            return_as_list = False
+        else:
+            return_as_list = True
             
         flat = self.flatten()
         
@@ -1272,6 +1351,10 @@ class RoadImage(np.ndarray):
             if tasks[i] != '_':
                 # Only link the new ones
                 self.__add_child__(img, op)
+
+        # When tasks is given as a string, return a single image.
+        if len(grads)==1 and not(return_as_list):
+            return grads[0]
         return grads
 
     @strict_accepts(object, bool, bool, bool)
@@ -1444,13 +1527,78 @@ class RoadImage(np.ndarray):
 
         self.binary = True
         return ret
+
+    @strict_accepts(object, (np.ndarray), str)
+    @generic_search()
+    @flatten_collection
+    def apply_mask(self, mask, op='and' , *, inplace=False):
+        """
+        Threshold does not work on binary images, and while make_collection().combine_masks() may work
+        for binary images, it will trigger warnings if the mask is not derived from the masked image.
+        Since usually masks come from other sources or files, which are fixed in the image processing
+        pipeline, we want to record self as the parent, and not mask.
+        If self is a collection, mask is applied to all the elements. 
+        The method has no access to the shape of the collection within @flatten_collection. To avoid
+        mistakes, the mask must be a single image or a collection of one image.
+        A single channel mask will be replicated to match the number of channels in self.
+        """
+        if inplace:
+            ret = self
+        else:
+            ret = np.empty_like(self)
+
+        if not(issubclass(type(mask),RoadImage)) or not(mask.binary) or not(self.binary):
+            raise TypeError('RoadImage.apply_mask: Image and mask must be binary RoadImages.')
+
+        flatmask = mask.flatten()
+        if flatmask.shape[3] != self.shape[3]:
+            if flatmask.shape[3] != 1:
+                raise ValueError('RoadImage.apply_mask: mask must have 1 channel or %d channels.'% self.shape[3])
+            flatmask = np.repeat(flatmask, self.shape[3], axis=3)
+
+        # The simplest implementation is to use make_collection, and combine_masks...
+        # We avoid the warnings and copy the data.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for ix, img in enumerate(self):
+                ret[ix] = RoadImage.make_collection([img,flatmask[0]], concat=False).combine_masks(op)[0]
+                
+        return ret
         
-    def warp(self, scale):
+    # Mathematically computed trapeze (could be replaced by formulas for a changing slope).
+    # Takes into account image size and camera orientation.
+    # 40 m trapeze
+    #TRAPEZE=np.array([[275,379],[584.6,159.6],[691.4,159.6],[1030,379]], dtype=np.float32)
+    # 70 m trapeze
+    TRAPEZE=np.array([[275,379],[607.5,141.8],[668.5,141.8],[1030,379]], dtype=np.float32)
+    # X scale :  2 cm per pixel
+    # Y scale : 10 cm per pixel
+    # Receive 40 m in 400 pixels high image
+    #LANE=np.array([[157.5,399],[157.5,  0],[342.5,  0],[342.5,399]],  dtype=np.float32)
+    # Receive 70 m in 700 pixels high image
+    LANE=np.array([[157.5,699],[157.5,  0],[342.5,  0],[342.5,699]],  dtype=np.float32)
+
+    @generic_search()
+    @flatten_collection
+    def warp(self):
         """
         Returns an image showing the road as seen from above.
+        Imput image must be a camera image shape 1280x720. The lines 300:680 are warped.
         The current implementation assumes a flat road.
         """
-        return self
+        if self.get_size() != (1280,720):
+            raise ValueError('RoadImage.warp: Only works on images size 1280 x 720.')
+
+        dsize=(500,700)
+        ret = np.empty(shape=(self.shape[0],)+dsize+(self.shape[3],), dtype=self.dtype).view(RoadImage)
+
+        persp_mat = cv2.getPerspectiveTransform(TRAPEZE,LANE)
+        #persp_mat_inv = cv2.getPerspectiveTransform(LANE,TRAPEZE)
+
+        for ix,img in self:
+            cv2.warpPerspective(self[300:680], persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
+            
+        return ret
 
     @strict_accepts(object, tuple)
     @generic_search(unlocked=True)
@@ -1465,6 +1613,231 @@ class RoadImage(np.ndarray):
             raise ValueError('RoadImage.crop: crop area must not be empty.')
         return self[:,y1:y2,x1:x2,:]
 
+    @strict_accepts(object, int, bool)
+    @generic_search()
+    @flatten_collection
+    def despeckle(self, *, size=1, inplace=False):
+        """
+        Remove isolated dots from binary images.
+        size indicates the size of the dots to eliminate in pixels.
+        """
+        if inplace:
+            ret = self
+        else:
+            ret = self.copy()
+            
+        if not(self.binary):
+            raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
+        
+        # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
+
+        # Process collection
+        for ix, img in enumerate(self):
+            if self.gradient:
+                # Self is a signed binary image (+1, 0, -1)
+                # we erode the mask, then we force zero everywhere the mask is zero.
+                mask = np.abs(img.to_float())
+                mask.gradient=False
+            else:
+                mask = img.copy()
+
+            cv2.erode(mask, kernel, dst=mask, iterations=size)
+            cv2.dilate(mask, kernel, dst=mask, iterations=size)
+            dst = ret[ix]
+            dst[(mask==0)] = 0
+            
+        return ret
+        
+    @strict_accepts(object, int, bool)
+    @generic_search()
+    @flatten_collection
+    def dilate(self, *, iterations=1, inplace=False):
+        """
+        Morphological dilatation of each channel independently.
+        """
+        if inplace:
+            ret = self
+        else:
+            ret = self.copy()
+            
+        if not(self.binary):
+            raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
+        
+        # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
+
+        # Process collection
+        for ix, img in enumerate(self):
+            if self.gradient:
+                # Self is a signed binary image (+1, 0, -1)
+                # we erode the mask, then we force zero everywhere the mask is zero.
+                mask = np.abs(img.to_float())
+                mask.gradient=False
+            else:
+                mask = img.copy()
+
+            cv2.dilate(mask, kernel, dst=mask, iterations=iterations)
+            dst = ret[ix]
+            dst[(mask==0)] = 0
+            
+        return ret
+        
+    @strict_accepts(object, int, bool)
+    @generic_search()
+    @flatten_collection
+    def erode(self, *, iterations=1, inplace=False):
+        """
+        Morphological erosion of each channel independently.
+        """
+        if inplace:
+            ret = self
+        else:
+            ret = self.copy()
+            
+        if not(self.binary):
+            raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
+        
+        # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
+
+        # Process collection
+        for ix, img in enumerate(self):
+            if self.gradient:
+                # Self is a signed binary image (+1, 0, -1)
+                # we erode the mask, then we force zero everywhere the mask is zero.
+                mask = np.abs(img.to_float())
+                mask.gradient=False
+            else:
+                mask = img.copy()
+
+            cv2.erode(mask, kernel, dst=mask, iterations=iterations)
+            dst = ret[ix]
+            dst[(mask==0)] = 0
+            
+        return ret
+        
+    @strict_accepts(object, (int, float, str), bool)
+    @generic_search()
+    def combine_masks(self, op, *, perchannel=True):
+        """
+        Accepts a collection of N masks, each one either single channel or multichannel,
+        and combines them together using P in N rule. If P=1, an 'OR' is performed,
+        if P=N, an 'AND' is performed. For intermediate values, a majority vote takes place.
+        Parameter op can be an integer P, or keywords 'or' and 'and' as strings, or a float percentage
+        between 0 and 1 (Caution: 1 is equivalent to 'or', and 1. is equivalent to 'and').
+        Per channel is the default mode of operation, where distinct combine operations take
+        place on each channel, returning an image with the same number of channels as the
+        collection. If per channel is False, the collection is processed like a collection of
+        single channel images and a single channel image is returned.
+        On gradient masks, -1 gradients compensate +1 gradients in other images. The resulting
+        pixel is -1 if the total is <=-P, and +1 if the total is >=P.
+        """
+        flat = self.flatten()
+        if not(self.binary):
+            raise ValueError('RoadImage.combine_masks: Image collection must be binary.')
+        if perchannel:   nbch=1
+        else:            nbch=flat.shape[3]
+        nbimg = flat.shape[0]
+        if op=='and':  op = nbimg * nbch  
+        elif op=='or': op = 1
+        elif type(op) is str:
+            raise ValueError("RoadImage.combine_masks: op must be 'or', 'and', or a number.")
+        elif type(op) is float:
+            if op > 1. or op < 0.:
+                raise ValueError("RoadImage.combine_masks: expressing a percentage, float op must be between 0. and 1.")
+            op = int(round(op * nbimg * nbch))
+            if op == 0:
+                op=1   # Force minimum 1, otherwise pixels at zero after the sum are undecided in gradient mode
+                warnings.warn("RoadImage.combine_masks: percentage for success is too low", RuntimeWarning)
+
+        if op < 1 or op > nbimg * nbch:
+            raise ValueError("RoadImage.combine_masks: op must be an integer between 1 and the number of images.")
+        
+        if perchannel:
+            ret = np.zeros_like(flat[0:1,:,:,:])
+            raw = flat.sum(axis=0, keepdims=True)
+        else:
+            ret = np.zeros_like(flat[0:1,:,:,0:1])
+            ret.colorspace='GRAY'
+            raw = flat.sum(axis=(0,3), keepdims=True)
+        
+        ret[(raw >= op)] = 1
+        if self.gradient:
+            ret[(raw <= -op)] = -1
+            
+        ret.binary=True
+        ret.gradient = self.gradient
+        
+        # Return a collection of the same ndim, but all collection dimensions collapsed to shape=1.
+        sh = RoadImage.__match_shape__(ret.shape[:-1], self.shape)
+        sh = sh[:-1] + (ret.shape[-1],)
+
+        return ret.reshape(sh)
+
+    @strict_accepts(object,int,bool,bool,bool)
+    @generic_search()
+    @flatten_collection
+    def integrate(self, *, ksize=100, invertx=False, inverty=False, inplace=False):
+        """
+        Works channel by channel on signed gradient images, which can be binary or not.
+        It uses the sign(d)/d² integration kernel to integrate by convolution in 2D.
+        The result is technically a gradient but not a binary image.
+        Two 1D passes are applied since the convolution is separable.
+        The result is not normalized.
+        invertx reverses the sign of the kernel during the x pass.
+        """
+        # TODO: some kind of local automatic balancing of + and -
+        if inplace:
+            ret = self
+        else:
+            ret = np.empty_like(self)
+            
+        if not(self.gradient):
+            raise ValueError('RoadImage.integrate: Operates on signed gradient images.')
+        if not(self.dtype == np.float32 or self.dtype == np.float64):
+            raise ValueError('RoadImage.integrate: Operates on float32 or float64 images. Use to_float().')
+        if not(ksize <= self.shape[1] and ksize <= self.shape[2]):
+            raise ValueError('RoadImage.integrate: Kernel size must be less than image width and height.')
+
+        # Some monotonous shape decreasing to -1, for instance linear
+        #kernel = np.array([ -2.*i/ksize for i in range(ksize//2) ], dtype=np.float32)
+        kernel = np.array([ -1. for i in range(ksize//2) ], dtype=np.float32)
+        # Antisymmetric duplication to ksize length
+        kernel = np.concatenate([kernel, -kernel[::-1]])
+        
+        for ix, img in enumerate(self):
+            # X-pass
+            for iy, line in enumerate(img):
+                # Operate line by line
+                for ic in range(self.shape[3]):
+                    if invertx:  l = np.convolve(line[:,ic], -kernel, mode='same')
+                    else:        l = np.convolve(line[:,ic], kernel, mode='same')
+                    ret[ix,iy,:,ic]=l
+            # Y-pass
+            for iy in range(self.shape[2]):
+                # Operate column by column
+                col = img[:,iy,:]
+                for ic in range(self.shape[3]):
+                    if inverty:  l = np.convolve(col[:,ic], -kernel, mode='same')
+                    else:        l = np.convolve(col[:,ic], kernel, mode='same')
+                    ret[ix,:,iy,ic]+=l
+        ret.binary = False        
+        return ret
+
+    @generic_search()
+    def invert(self):
+        """
+        Does the very simple operation of changing the sign of signed gradients.
+        Doing it with numpy makes it lose its binary quality.
+        """
+        if not(self.gradient):
+            raise ValueError('RoadImage.invert: Image must be a signed gradient (gradient x or gradient y).') 
+        ret = np.empty_like(self, subok=True)
+        ret[:] = -self
+        ret.binary=True
+        return ret
+    
     def __slice__(self):
         """
         Placeholder method used to trace lignage between images when a = b[slice]
