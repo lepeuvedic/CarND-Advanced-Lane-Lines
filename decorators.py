@@ -240,7 +240,10 @@ def flatten_collection(f):
         flat = self.flatten()
         ret = f(flat, *args, **kwargs)
         # Put the collection back in the original shape
-        ret = ret.reshape(self.shape[:-3]+ret.shape[1:])
+        if type(ret) is tuple:
+            ret = tuple([ x.reshape(self.shape[:-3]+x.shape[1:]) for x in list(ret)])
+        else:
+            ret = ret.reshape(self.shape[:-3]+ret.shape[1:])
         # reshape sets ret.crop_area to full image size
         return ret
     return flat_wrapper
@@ -283,3 +286,14 @@ def varnames(f):
         return f(*args, **kwargs)
     return varnames_wrapper
 
+def static_vars(**kwargs):
+    """
+    Decorator used with named arguments, which adds the arguments
+    to the function inside. ??Must be used LAST in the stack of decorators,
+    otherwise some intermediate function will receive the variables.??
+    """
+    def wrap_static_vars(func):
+        for k in kwargs:
+            setattr(func, k, kwargs[k])
+        return func
+    return wrap_static_vars
