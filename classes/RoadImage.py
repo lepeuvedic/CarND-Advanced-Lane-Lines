@@ -5,9 +5,11 @@ from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, LinearSegmentedColormap
 import warnings
 from weakref import WeakValueDictionary as WeakDict
-from decorators import strict_accepts, generic_search, flatten_collection
-from decorators import _make_hashable, static_vars
+from .decorators import strict_accepts, generic_search, flatten_collection
+from .decorators import _make_hashable, static_vars
 from .CameraCalibration import CameraCalibration
+from .Line import Line
+from .LinePoly import LinePoly
 
 class RoadImage(np.ndarray):
 
@@ -101,6 +103,64 @@ class RoadImage(np.ndarray):
         # Finally, we must return the newly created object:
         return obj
 
+    def _inherit_attributes(self, obj, binary_test=True):
+        """
+        Inherit the values of attributes from obj.
+        If obj is a road image, those attributes are copied.
+        Line instances are shared in a family of related images.
+        If obj is a numpy array, those attributes are initialized to default values.
+        """
+        # By default binary is False, but for __new__ RoadImages (obj is None or numpy array),
+        # an attempt is made to assess binarity.
+        try:
+            self.binary = True
+            self.binary = obj.binary  # may raise AttributeError
+        except AttributeError:
+            pass
+        if self.binary and binary_test:
+            # Lots of images made only from binary images are not binary.
+            # For instance, the np.sum() of a collection of binary images has integer pixel values,
+            # but is not always binary. Normal values of binary images are -1 (signed only), 0, 1.
+            # Perform expensive test:
+            bcast = np.broadcast(1,self)
+            v = np.broadcast_to(self, bcast.shape)  # returns a numpy.ndarray
+            maxi = v.max()
+            mini = v.min()
+            if not(np.isfinite(maxi) and np.isfinite(mini)) or\
+               not(mini == maxi or mini == 0 or abs(mini+maxi)<10.*np.finfo(type(maxi)).eps):
+                # It implies that the max or the min is not in the set { -1, 0 , 1 }.
+                self.binary = False
+            else:
+                ones  = np.broadcast_to(maxi, bcast.shape)
+                zeros = np.broadcast_to(0, bcast.shape)
+                mones  = np.broadcast_to(mini, bcast.shape)  # for minus one
+
+                if np.int8(mini) >= 0:
+                    # Use binary test for non-gradient (unsigned) images
+                    mask = ((v==ones) | (v==zeros))
+                else:
+                    mask = ((v==ones) | (v==zeros) | (v==mones))
+                self.binary = bool(mask.all())
+        else:
+            # Non binary ancestor or no binary_test
+            self.binary = False
+
+        #self.serial = getattr(obj, 'serial', 0) + 1           # Helps with code tracing (DEBUG)
+        self.warped = getattr(obj, 'warped', False)           # True for images returned by 'warp'
+        self.colorspace = getattr(obj, 'colorspace', 'RGB')   # inherited, set by __new__ for new instances
+        self.gradient = getattr(obj, 'gradient', False)       # True for a gradient image: inherited
+        self.undistorted = getattr(obj, 'undistorted', False) # True for undistorted images
+        self.filename = getattr(obj, 'filename', None)        # filename is inherited
+        
+        # New instance, create new blank instances of Line from default Factory
+        # The program can set the default line at any time.
+        # Built from another road image: same family share the instances.
+        self.farleft  = getattr(obj, 'farleft', Line.Factory())
+        self.left     = getattr(obj, 'left', Line.Factory())
+        self.right    = getattr(obj, 'right', Line.Factory())
+        self.farright = getattr(obj, 'farright', Line.Factory())
+        return
+        
     def __array_finalize__(self, obj):
         # When called from __new__,
         # ``self`` is a new object resulting from ndarray.__new__(RoadImage, ...), therefore it only has
@@ -131,32 +191,17 @@ class RoadImage(np.ndarray):
         # Children from a tree. Branches which are no longer referenced may be deleted.
         self.child = WeakDict()
         
-        # By default binary is False, but for __new__ RoadImages (obj is None or numpy array),
-        # an attempt is made to assess binarity.
-        #self.binary = getattr(obj, 'binary', False)
-        maybe_binary = getattr(obj, 'binary', True)        # True for an image containing only 0 and 1: inherited
-        if maybe_binary:
-            # Lots of images made only from binary images are not binary. For instance, the np.sum() of a
-            # collection of binary images has integer pixel values, but is not always binary
-            data = np.copy(self)
-            if self.dtype == np.uint8:
-                self.binary = bool(((data==1) | (data==0)).all())
-            else:
-                self.binary = bool(((data==1) | (data==0) | (data==-1)).all())
-        else:
-            self.binary = False
-            
         # By default inherited
-        self.colorspace = getattr(obj, 'colorspace', 'RGB')   # inherited, set by __new__ for new instances
-        self.gradient = getattr(obj, 'gradient', False)       # True for a gradient image: inherited
-        self.filename = getattr(obj, 'filename', None)        # filename is inherited
+        self._inherit_attributes(obj)
         
         # We could have got to the ndarray.__new__ call in 3 ways:
-        # From an explicit constructor - e.g. InfoArray():
+        # From an explicit constructor - e.g. RoadImage():
         #    obj is None
         #    (we're in the middle of the RoadImage.__new__ constructor)
         if obj is None:
-            return
+            # We never call super() to initialize new instance. All instances are created
+            # with .view(RoadImage) from a numpy array.
+            assert not(obj is None), 'RoadImage.__array_initialize__: BUG: __init__ from None!?'
 
         # From view casting - e.g img.view(RoadImage):
         #    obj is img
@@ -170,10 +215,14 @@ class RoadImage(np.ndarray):
             if is_inside:
                 # Compute crop_area x1,y1
                 #print('Compute crop: self='+str(crop_bounds)+'  parent='+str(bounds))
+                #print('Shape:   self='+str(self.shape)  +'  parent='+str(obj.shape))
+                #print('Strides: self='+str(self.strides)+'  parent='+str(obj.strides))
                 # First corner
                 byte_offset = crop_bounds[0] - bounds[0] 
-                assert byte_offset < bounds[1]-bounds[0], \
+                assert byte_offset <= bounds[1]-bounds[0], \
                         'RoadImage:__array_finalize__ BUG: Error in crop_area 1 computation.'
+                # can be equal if both self and obj have collapsed to zero size in one dimension.
+                # In this case, bounds[0] effectively points *after* the end (and equals bounds[1]).
 
                 # Find coords
                 coords1 = []
@@ -187,8 +236,11 @@ class RoadImage(np.ndarray):
                 assert byte_offset == 0, 'RoadImage:__array_finalize__ BUG: crop_area 1 computation: item_offset != 0.'
 
                 # Second corner (crop_bounds[1] is 1 item after the last element of self)
-                byte_offset = crop_bounds[1] - self.itemsize - bounds[0]
-                assert byte_offset < bounds[1]-bounds[0], \
+                byte_offset = crop_bounds[1] - bounds[0]
+                if byte_offset == 0:
+                    raise ValueError('RoadImage.crop: Cropped area has size zero.')
+                byte_offset -= self.itemsize
+                assert byte_offset <= bounds[1]-bounds[0], \
                         'RoadImage:__array_finalize__ BUG: Error in crop_area 2 computation.'
 
                 # Find coords
@@ -244,9 +296,15 @@ class RoadImage(np.ndarray):
             # If the object we build from is a RoadImage, we link child to parent and parent to child
             # but @generic_search will overwrite this link for operations other than those inferred above.
             if issubclass(type(obj), RoadImage):
-                if is_inside:
-                    obj.__add_child__(self, op, unlocked=True)
-
+                # Share the Line instances: they are shared across a whole family of related images.
+                # A Line instance can hold multiple geometries, associated with keys in a dict().
+                # If a road image contains a collection, image indexes in the collection can be
+                # a part of the key, in order to store different geometries for each image.
+                
+                if is_inside:  obj.__add_child__(self, op, unlocked=True)
+                
+            return
+        raise TypeError("RoadImage: cast of %s to RoadImage is invalid."% str(type(obj)))
         # We do not need to return anything
 
     def __del__(self):
@@ -912,9 +970,9 @@ class RoadImage(np.ndarray):
         else:
             mpimg.imsave(filename, flat[0], format=format)
 
-    __red_green_cmap__ = None
-
-    @strict_accepts(object, Axes, (str,None,Colormap), bool)  
+    
+    @strict_accepts(object, Axes, (str,None,Colormap), bool)
+    @static_vars(__red_green_cmap__ = None)
     def show(self, axis, *, cmap=None, alpha=True, title=None):
         """
         Display image using matplotlib.pyplot.
@@ -935,10 +993,10 @@ class RoadImage(np.ndarray):
             # Specific displays for gradients
             if nb_ch == 1:
                 if cmap is None:
-                    if RoadImage.__red_green_cmap__ is None:
+                    if RoadImage.show.__red_green_cmap__ is None:
                         colors = [(1, 0, 0), (0, 0, 0), (0, 1, 0)]  # R -> Black -> G
-                        RoadImage.__red_green_cmap__ = LinearSegmentedColormap.from_list('RtoG', colors, N=256) 
-                    cmap = RoadImage.__red_green_cmap__
+                        RoadImage.show.__red_green_cmap__ = LinearSegmentedColormap.from_list('RtoG', colors, N=256) 
+                    cmap = RoadImage.show.__red_green_cmap__
                 img = flat.to_float().view(np.ndarray)[0,:,:,0]
                 axis.imshow(img, vmin=-1, vmax=1, cmap = cmap)
             else:
@@ -950,7 +1008,10 @@ class RoadImage(np.ndarray):
         else:
             if nb_ch == 1:
                 if cmap is None:
-                    cmap = 'gray'
+                    if   self.colorspace=='GRAY': cmap = 'gray'
+                    elif self.colorspace=='RGB' : cmap = 'cubehelix'
+                    elif self.colorspace=='HLS' or self.colorspace=='HSV' : cmap = 'hsv'
+                    else:                          cmap = 'gnuplot2'
                 # N.B. RoadImage does not allow the removal of the channels axis
                 # therefore we have to view the data as a simple numpy array.
                 img = flat.to_float().view(np.ndarray)[0,:,:,0]
@@ -960,7 +1021,7 @@ class RoadImage(np.ndarray):
                     img = flat[0].to_float()
                 else:
                     img = flat[0,:,:,0:3].to_float()
-                axis.imshow(img)
+                axis.imshow(img, vmin=0, vmax=1)
         if title:
             axis.set_title(title, fontsize=30)
                 
@@ -1007,45 +1068,108 @@ class RoadImage(np.ndarray):
         else:
             nb_img = 1
         ret = self.reshape((nb_img,)+self.shape[-3:])
+        #print('DEBUG(serial): ret =',ret.serial,' self=',self.serial) # serials increase by one
 
         assert not(ret.crop_area is None) , 'RoadImage.flatten: BUG: No crop area'
         return ret
         
     def channel(self,n):
         """
-        Return a RoadImage with the same shape as self, but only one channel. The returned RoadImage shares
-        if underlying data with self.
+        Return a RoadImage with the same shape as self, but only one channel. 
+        The returned RoadImage shares its underlying data with self.
+        channel() is recorded as a channels() operation.
         """
-        return self.channels(n,n+1)
+        return self.channels(range(n,n+1))
 
-    @strict_accepts(object,int,int)
+    @strict_accepts(object,(int,range),(int,None),bool)
     @generic_search(unlocked=True)
     @flatten_collection
-    def channels(self,n,m):
+    def channels(self,n,m=None, *, isview=True):
         """
-        Returns a RoadImage with the same shape as self, but only channels n to m-a.
+        Returns a RoadImage with the same shape as self, but only channels n to m.
+        If m is larger than the number of channels in self, zeroed channels are added.
+        For instance on a RGB image, channels(2,5) will place the blue channel of the source
+        image in the red channel of the destination image, and will add two zeroed channels.
+        By default x.channels(n) is a view on x data. Writing into channels() writes into x.
+        It is mandatory to specify isview=False when adding new channels.
         """
-        # Specific code
-        if not(n>=0 and n<self.shape[3]):
-            msg = 'RoadImage.channels() argument #1: n must be non-negative and less than nb of channels.'
-            raise ValueError(msg) 
-        if not( m>n and m<=self.shape[3]):
-            msg = 'RoadImage.channels() argument #2: m must be such that m > n and m <= nb of channels.'
-            raise ValueError(msg)
+        try:
+            # See if it quacks
+            rng = n
+            n = rng.start
+            m = rng.stop
+            step = rng.step
+        except AttributeError as e:
+            try:
+                if m is None: m = n+1
+                step = 1
+                rng = range(n,m,step)
+            except TypeError as e:
+                raise TypeError('RoadImage.channels: n and m must be two integers.')
+            
+        # Check for empty result
+        if len([ch for ch in rng]) == 0:
+            raise ValueError('RoadImage.channels: The selected range of channels must not be empty.')
 
-        ret = self[:,:,:,n:m]  # Main operation
-        if n>0 or m<3:
-            ret.colorspace = None
+        # Specific code
+        if not(isview) or n<=-1 or n>=self.shape[3] or m>self.shape[3] or m<-1:
+            # All the tests are needed because step can be negative to reverse the order of the channels
+            if isview:
+                raise ValueError('RoadImage.channels: Default behavior is not compatible with '+
+                                 'the creation of new channels. Call with leftvalue=False.')
+            # Allocate new storage
+            l = len([i for i in rng]) # Count channels to create
+            if l==0:
+                raise ValueError('RoadImage.channels: range(%d,%d,%d) results in zero channel image.'
+                                 % (n,m,step))
+            ret = np.zeros(shape=self.shape[0:3]+(l,), dtype=self.dtype).view(RoadImage)
+
+            # Copy data
+            cp = [i for i in rng if i>=0 and i < self.shape[3]]
+            l = len(cp) # Count channels to copy
+            # recompute n,m from cp.
+            n = cp[0]
+            m = cp[-1]
+            if step > 0: m+=1
+            else:        m-=1
+            p = len([i for i in rng if i<0]) # Count prepended zero channels
+            if l>0:
+                # Same bug as below: self[:,:,:,n:m:step] could be empty if m<0
+                if m<0:
+                    ret[:,:,:,p:p+l] = self[:,:,:,n::step]  # Using cp or rng directly
+                else:                                       # triggers an extra copy of self.
+                    ret[:,:,:,p:p+l] = self[:,:,:,n:m:step]
+        else:
+            if (m<=n and step>0) or (m>=n and step<0):
+                raise ValueError('RoadImage.channels: range(%d,%d,%d) results in zero channel image.'
+                                 % (n , m , step))
+            # There is a bug in numpy which makes it generate zero size arrays, collapsed in the
+            # channels dimension, if m is explicitly listed as -1 (or some other negative value)
+            # when step is negative. The equivalent n::step formulation works.
+            if m<0:
+                ret = self[:,:,:,n::step]
+            else:
+                ret = self[:,:,:,n:m:step]  # Main operation. Using rng triggers a copy.
+            
+        ret.colorspace = self.colorspace
         ret.gradient = self.gradient
         ret.binary = self.binary
+        ret.warped = self.warped
         return ret
 
-    def rgb(self):
+    def rgb(self,n=0):
         """
-        Shortcut for self.channels(0,3)
+        Shortcut for self.channels(0,3). Works to eliminate extraneous channels or to add new
+        ones to single channel image. If channels are added the operation is not performed inplace,
+        and the resulting image does not share data with its parent.
+        Parameter n indicates the channel in the destination image, the source channel ends in.
+        rgb() is recorded as a channels() operation.
         """
-        return self.channels(0,3)
-        
+        try:
+            return self.channels(range(0-n,3-n))
+        except ValueError:
+            return self.channels(range(0-n,3-n), isview=False)
+    
     # Operations which generate a new road image. Unlike the constructor and copy, those functions store handles to
     # newly created RoadImages in the self.children dictionary, and memorize the source image as parent.
     
@@ -1142,6 +1266,7 @@ class RoadImage(np.ndarray):
 
         ret.binary = self.binary
         ret.gradient = self.gradient
+        ret.warped = self.warped
         return ret
 
     @generic_search()
@@ -1174,6 +1299,7 @@ class RoadImage(np.ndarray):
             ret[:] = scaling * self #.astype(np.float32)
         ret.binary = self.binary
         ret.gradient = self.gradient
+        ret.warped = self.warped
         return ret
 
     # Remove camera distortion
@@ -1193,7 +1319,7 @@ class RoadImage(np.ndarray):
 
         for index, img in enumerate(self):
             ret[index] = cal.undistort(img)
-
+        ret.undistorted = True
         return ret
         
     # Resize image
@@ -1517,9 +1643,8 @@ class RoadImage(np.ndarray):
             else:
                 dtype = np.uint8
             ret = np.zeros_like(self, dtype=dtype)
-            ret.colorspace = self.colorspace
-            ret.binary = True
-            ret.gradient = self.gradient
+            #print('DEBUG(serials):',self.serial,'to',ret.serial)
+            ret._inherit_attributes(self, binary_test=False)
 
         # Apply operation 
         if self.gradient:
@@ -1540,7 +1665,7 @@ class RoadImage(np.ndarray):
             else:
                 ret[(data >= mini) & (data <= maxi)] = 1
 
-        self.binary = True
+        ret.binary = True
         return ret
 
     @strict_accepts(object, (np.ndarray), str)
@@ -1571,28 +1696,39 @@ class RoadImage(np.ndarray):
                 raise ValueError('RoadImage.apply_mask: mask must have 1 channel or %d channels.'% self.shape[3])
             flatmask = np.repeat(flatmask, self.shape[3], axis=3)
 
+        #zeroes = np.zeros(shape=(1,1,1,1))
+        zeroes = np.zeros_like(ret[0])
+        
         # The simplest implementation is to use make_collection, and combine_masks...
         # We avoid the warnings and copy the data.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for ix, img in enumerate(self):
-                ret[ix, (flatmask[0]==0)]=0
-                #ret[ix] = RoadImage.make_collection([img,flatmask[0]], concat=False).combine_masks(op)[0]
+                ret[ix, (flatmask[0]==zeroes)]=0
                 
         return ret
-        
-    # Mathematically computed trapeze (could be replaced by formulas for a changing slope).
-    # Takes into account image size and camera orientation (see vodes.ods).
-    # 40 m trapeze
-    #TRAPEZE=np.array([[275,379],[584.6,159.6],[691.4,159.6],[1030,379]], dtype=np.float32)
-    # 70 m trapeze
-    TRAPEZE=np.array([[275,379],[607.5,141.8],[668.5,141.8],[1030,379]], dtype=np.float32)
-    # X scale :  2 cm per pixel
-    # Y scale : 10 cm per pixel
-    # Receive 40 m in 400 pixels high image
-    #LANE=np.array([[157.5,399],[157.5,  0],[342.5,  0],[342.5,399]],  dtype=np.float32)
-    # Receive 70 m in 700 pixels high image
-    LANE=np.array([[157.5,699],[157.5,  0],[342.5,  0],[342.5,699]],  dtype=np.float32)
+
+    @classmethod
+    def warp_size(cls, cal, *, z, w=3.7, h, scale, curvrange):
+        """
+        Computes the size of the image needed to receive a warped image, using
+        assumption regarding the curvature, and a defined scale in m/pixel.
+        z and h are the parameters for the method cal.lane()
+        Returns a dsize tuple in the correct format for cv2.warpPerspective(),
+        and the position of the camera in pixels.
+        """
+        trapeze, rectangle, z_sol = cal.lane(z=z, w=w, h=h)
+        lcurv, rcurv = curvrange
+        # Impose minimum curvature which ensures that the start of the lane line is visible
+        if lcurv > -0.001: lcurv = -0.001
+        if rcurv <  0.001: rcurv =  0.001
+        sx, sy = scale
+        img_width = ( int(( 0.5 * z**2 * lcurv + rectangle[0][0]) / sx),
+                      int(( 0.5 * z**2 * rcurv + rectangle[3][0]) / sx))
+        img_height = int((z - z_sol) / sy)
+        dsize = ( img_width[1]-img_width[0], img_height )
+
+        return dsize, -img_width[0]
 
     @generic_search()
     @flatten_collection
@@ -1612,16 +1748,14 @@ class RoadImage(np.ndarray):
         if self.get_size() != cal.get_size():
             raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
 
-        trapeze, rectangle, z_sol = cal.lane(z=z,h=h)
         lcurv, rcurv = curvrange
         sx, sy = scale
-        img_width = ( int(( 0.5 * z**2 * lcurv + rectangle[0][0]) / sx),
-                      int(( 0.5 * z**2 * rcurv + rectangle[3][0]) / sx))
-        img_height = int((z - z_sol) / sy)
-        dsize = ( img_width[1]-img_width[0], img_height )
+
+        trapeze, rectangle, z_sol = cal.lane(z=z,h=h)
+        dsize, img_cx = RoadImage.warp_size(cal, z=z, h=h, scale=scale, curvrange=curvrange)
         
         # Compute new rectangle coordinages in pixels, fitting inside dsize
-        rect = np.array([ [x / sx - img_width[0], img_height - (y - z_sol) / sy ]
+        rect = np.array([ [x / sx + img_cx, dsize[1] - (y - z_sol) / sy ]
                           for x,y in rectangle ], dtype=np.float32)
 
         ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype)\
@@ -1631,6 +1765,8 @@ class RoadImage(np.ndarray):
 
         for ix,img in enumerate(self):
             cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
+
+        ret.warped = True
         return ret
 
     @strict_accepts(object, tuple)
@@ -1662,7 +1798,9 @@ class RoadImage(np.ndarray):
         if not(self.binary):
             raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
         
-        # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
+        zeroes = np.zeros_like(ret[0])
+        
+         # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
         kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
 
         # Process collection
@@ -1677,8 +1815,7 @@ class RoadImage(np.ndarray):
 
             cv2.erode(mask, kernel, dst=mask, iterations=size)
             cv2.dilate(mask, kernel, dst=mask, iterations=size)
-            dst = ret[ix]
-            dst[(mask==0)] = 0
+            ret[ix,(mask==zeroes)] = 0
             
         return ret
         
@@ -1696,6 +1833,8 @@ class RoadImage(np.ndarray):
             
         if not(self.binary):
             raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
+
+        ones = np.ones_like(ret[0])
         
         # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
         kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
@@ -1711,8 +1850,7 @@ class RoadImage(np.ndarray):
                 mask = img.copy()
 
             cv2.dilate(mask, kernel, dst=mask, iterations=iterations)
-            dst = ret[ix]
-            dst[(mask==1)] = 1
+            ret[ix,(mask==ones)] = 1
             
         return ret
         
@@ -1731,6 +1869,8 @@ class RoadImage(np.ndarray):
         if not(self.binary):
             raise ValueError('RoadImage.despeckle: Image must be binary (e.g. from threshold).')
         
+        zeroes = np.zeros_like(ret[0])
+
         # Opencv erode does not work on int8 images, and behaves as dilate for negative valued pixels
         kernel = cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
 
@@ -1745,8 +1885,7 @@ class RoadImage(np.ndarray):
                 mask = img.copy()
 
             cv2.erode(mask, kernel, dst=mask, iterations=iterations)
-            dst = ret[ix]
-            dst[(mask==0)] = 0
+            ret[ix,(mask==zeroes)] = 0
             
         return ret
         
@@ -1801,6 +1940,7 @@ class RoadImage(np.ndarray):
             
         ret.binary=True
         ret.gradient = self.gradient
+        ret.warped = self.warped
         
         # Return a collection of the same ndim, but all collection dimensions collapsed to shape=1.
         sh = RoadImage.__match_shape__(ret.shape[:-1], self.shape)
@@ -1941,12 +2081,16 @@ class RoadImage(np.ndarray):
         # (lrmask is a single binary image the same size as self, or a collection as long as self)
         if lrmask is None:
             if cal:
-                #TODO: left and right halves based on camera centre
-                pass
-            #else:
-            # TODO: memorize lrmask and avoid doing the resize for each call.
-            # lrmask could be a dict of lrmask solutions. lrmask has ones on RIGHT side
-            lrmask = cv2.resize(np.array([[0,1]]), self.get_size(), interpolation=cv2.INTER_NEAREST)
+                # left and right halves based on ahead vector (defaults to camera centre)
+                xc,yc = cal.get_ahead(0)  # straight ahead vector on camera
+                lrmask = np.ones_like(self[0].channel(0),subok=False)
+                lrmask[:,0:int(xc),:] = 0 
+            else:
+                # TODO: memorize lrmask and avoid doing the resize for each call.
+                #       but do it as a cache because lrmask is adaptative.
+                # lrmask could be a dict of lrmask solutions. lrmask has ones on RIGHT side
+                lrmask = cv2.resize(np.array([[0,1]]), self.get_size(),
+                                    interpolation=cv2.INTER_NEAREST)
             lrmask = RoadImage( lrmask,  src_cspace='GRAY')  # gives shape=(h,w,1)
         elif lrmask == 'auto' or lrmask == 'last':
             raise NotImplementedError("RoadImage.extract_lines: lrmask='auto' is not implemented.")
@@ -2021,35 +2165,120 @@ class RoadImage(np.ndarray):
                                  concat=True)\
                 .combine_masks(2, perchannel=False)  #op=2 or 1
 
-        import matplotlib.pyplot as plt
-        figure, ((ax1, ax2), (ax3, ax4), (ax5, ax6), (ax7, ax8)) \
-            = plt.subplots(nrows=4, ncols=2, figsize=(20,26))
+        # import matplotlib.pyplot as plt
+        # figure, ((ax1, ax2), (ax3, ax4), (ax5, ax6), (ax7, ax8)) \
+        #     = plt.subplots(nrows=4, ncols=2, figsize=(20,26))
         
-        gxy = RoadImage.make_collection([gleft, gright], concat=True).combine_masks('or')
-        img.show(ax1, title='Original image')
-        g.show(ax2, title='Result of gradients')
-        gxy.show(ax3, title='Gradients x and y (not used)')
-        gam.show(ax4, title='Gradients a and m')
-        gr.show(ax5, title='Masked gradients')
-        imgcol.show(ax6, title='colors masked')
-        gleft.show(ax7, title='Integrated gradient (left)')
-        gright.show(ax8, title='Integrated gradient (right)')
+        # gxy = RoadImage.make_collection([gleft, gright], concat=True).combine_masks('or')
+        # img.show(ax1, title='Original image')
+        # g.show(ax2, title='Result of gradients')
+        # gxy.show(ax3, title='Gradients x and y (not used)')
+        # gam.show(ax4, title='Gradients a and m')
+        # gr.show(ax5, title='Masked gradients')
+        # imgcol.show(ax6, title='colors masked')
+        # gleft.show(ax7, title='Integrated gradient (left)')
+        # gright.show(ax8, title='Integrated gradient (right)')
 
         return final
         
     @generic_search()
     @flatten_collection
-    def find_lines(self):
+    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), method):
         """
         Gets a warped version of self, and looking at the bottom quarter of that image
         Locate the start of the left and right lane lines. 
-        The result is a tuple.
-        Returns None if a line is not found.
+        The result is a small image or image collection, in which pixel[0,0] is the 
+        x pixel coordinate of the left lane line, and pixel[0,1] is the x pixel coordinate
+        of the right lane line.
         """
-        # Will not be computed if it exists already
-        filter = img.extract_lines()
-
+        # TODO: compute mask from curvrange and cal
         
+        # Will not be computed if it exists already
+        filter = self.extract_lines(cal)
+        warped = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+        # warp_size returns the size of warped ( warped.get_size() )
+        # and the x position of the camera. They are optimized as a function of curvrange.
+        dsize, img_cx = RoadImage.warp_size(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+        w,h = dsize
+        sx = scale[0]
+        # Allocate space for results, copying the input image in the blue channel
+        ret = warped.channels(range(-2,1), isview=False)
+
+        window_width = 30 
+        window = np.ones(window_width) # Create our window template that we will use for convolutions
+
+        # From the camera position, the search zone for line lanes extends from 0.5m to 3.6m
+        lsearch = range(max(0, int(img_cx - 3.6 / sx)), max(window_width, int(img_cx - 0.5 / sx)))
+        rsearch = range(min(w-window_width, int(img_cx + 0.5 / sx)), min(w, int(img_cx + 3.6 / sx)))
+
+        for ix, img in enumerate(warped):
+            
+            # Sum quarter bottom of image to get slice, could use a different ratio
+            l_sum = np.sum(img[int(3*img.shape[0]/4):,lsearch], axis=(0,2))
+            l_center = np.argmax(np.convolve(window,l_sum))-window_width/2+lsearch.start
+            r_sum = np.sum(img[int(3*img.shape[0]/4):,rsearch], axis=(0,2))
+            r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+rsearch.start
+
+            print('left x0 =', l_center, '  right x0 =', r_center)
+            width = int(r_center - l_center)
+            ret[ix].channel(1)[:] = method(warped[ix], x=l_center, line=self.left,
+                                           lanew=width, scale=scale)
+            ret[ix].channel(0)[:] = method(warped[ix], x=r_center, line=self.right,
+                                           lanew=width, scale=scale)
+
+        return ret
+    
+    def centroids(self, *, x, line, lanew, scale):
+        """
+        'centroids' is called by find_lines() on a single image of a flattened collection.
+        The returned image is RGB, with the warped B&W image as blue, the left lane line as green, 
+        and the right lane line as red.
+        self is an image.
+        x is the initial x coordinate of the lane line to extract.
+        line is a handle to an instance of class Line, which must be updated by the method.
+        lanew is the lane width on self, expressed in pixels, used as a scaling factor for the centroid.
+        scale is the scale of the warped image in m/pixel, stored as (sx,sy). 
+        """
+        # self is warped image
+        assert self.warped, "RoadImage.centroids: Call this method via 'find_lines()'."
+        sx, sy = scale
+        h = self.shape[0]
+
+        # The course does centroids layer 4 m long
+        nb_layer = int(h*sy/5)
+        window_height = h // nb_layer
+        window_width = lanew * 50 // 640
+        margin = lanew * 100 // 640
+        window = np.ones(window_width) # Create our window template that we will use for convolutions
+
+        ret = np.zeros_like(self)  # Single channel image
+
+        # Ancillary subroutine to draw masks
+        # ret, self, h, window_height, window_width are read from the enclosing function environment.
+        def window_mask(center,level):
+            ret[int(h-(level+1)*window_height):int(h-level*window_height),
+                max(0,int(center-window_width/2)):min(int(center+window_width/2),self.shape[1])] = 1
+
+        # Trace first centroid
+        window_mask(x, 0)
+        
+        for level in range(1,nb_layer):
+            # convolve the window into the vertical slice of the image
+            image_layer = np.sum(self[int(h-(level+1)*window_height):int(h-level*window_height),:],
+                                 axis=(0,2))
+            conv_signal = np.convolve(window, image_layer)
+            # Find the best left centroid by using past left center as a reference
+            # Use window_width/2 as offset because convolution signal reference is
+            # at right side of window, not center of window
+            offset = window_width/2
+            min_index = int(max(x+offset-margin,0))
+            max_index = int(min(x+offset+margin,self.shape[1]))
+            x = np.argmax(conv_signal[min_index:max_index])+min_index-offset
+            # Draw what we found for that layer
+            window_mask(x, level)
+
+        return ret
+       
     # List of operations which update automatically when the parent RoadImage is modified.
     # Currently this is only supported for operations implemented as numpy views.
     AUTOUPDATE = [ 'flatten', 'crop', 'channels', 'ravel', '__slice__' ]

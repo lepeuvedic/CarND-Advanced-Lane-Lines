@@ -220,22 +220,11 @@ class CameraCalibration(object):
         Define the height of the camera above the ground, in real units (meters).
         """
         self.camheight = h
-        
-    def lane(self, z=70, w=3.7, h=0):
+
+    def lane_start(self, h=0):
         """
-        With default values, it returns the pixel coordinates of a trapeze, which depicts
-        a driving lane centered on the camera, starting from the car and extending z real
-        units ahead.
-        If h is given, instead of placing the camera at camera_height above the trapeze, 
-        the lane will be placed camera_height - h *below* the camera. Positive h value
-        describe a hill in front of the car, negative ones, a hole. Note that once the 
-        car is established in the upward path on the hillside, the hill ahead may appear
-        as sloping down. 
-        w is the width of the lane. Defaults values for z and w and 70 m and 3.7 m (US std).
-        z, w and h can be given as lists. The trapeze will not look like a trapeze in this case.
-        The function returns the trapeze as a tuple of 4 (x,y) tuples, the corresponding
-        rectangle in real world units (width w, length z) and the distance z_sol between
-        the camera and the first visible part of the lane.
+        Returns information about the nearest visible road area, which is visible at the 
+        bottom of Road Images, but is usually hidden by the vehicle's hood.
         """
         focalx,focaly = self.focal_length('xy')            # Focal length (pixels)
         centerx,centery = self.get_center()                # Optical axis (pixels)
@@ -247,7 +236,47 @@ class CameraCalibration(object):
         # Notations:
         # d: distance along the camera axis
         # z: distance in the lane direction (same as ahead for the virtual straight lane)
-        d_eol = z * cos(anglex)
+        fov_y = atan((height-centery)/focaly)                   # The lower half of the field of view
+
+        # Technically, the equation giving the distance to the start of (visible) lane
+        # must be solved, because h can be dependent on the distance.
+        # So it is : d_sol = (self.camheight - h(z_sol)) / tan(fov_y - angley)
+        #     and  : z_sol = d_sol / cos(anglex)
+        if type(h) is list:
+            raise NotImplementedError('CameraCalibration.lane_start: height map h is not implemented.')
+        d_sol = self.camheight / tan(fov_y - angley)
+        z_sol = d_sol / cos(anglex)       # distance from camera to sol over the ground
+
+        return z_sol, d_sol, anglex, angley
+        
+    def lane(self, z=70, w=3.7, h=0):
+        """
+        With default values, it returns the pixel coordinates of a trapeze, which depicts
+        a driving lane centered on the camera, starting from the car and extending z real
+        units ahead.
+        If h is given, instead of placing the camera at camera_height above the trapeze, 
+        the lane will be placed camera_height - h *beelow* the camera. Positive h value
+        describe a hill in front of the car, negative ones, a hole. Note that once the 
+        car is established in the upward path on the hillside, the hill ahead may appear
+        as sloping down. 
+        w is the width of the lane. Defaults values for z and w and 70 m and 3.7 m (US std).
+        z, w and h can be given as lists. The trapeze will not look like a trapeze in this case.
+        The function returns the trapeze as a tuple of 4 (x,y) tuples, the corresponding
+        rectangle in real world units (width w, length z) and the distance z_sol between
+        the camera and the first visible part of the lane.
+        """
+        focalx,focaly = self.focal_length('xy')            # Focal length (pixels)
+        centerx,centery = self.get_center()                # Optical axis (pixels)
+        width, height = self.get_size()                    # Image dimensions (pixels)
+
+        # distance from camera to sol over the ground, direction of ahead as angles
+        z_sol, d_sol, anglex, angley = self.lane_start(h)
+        
+        # Notations:
+        # d: distance along the camera axis
+        # z: distance in the lane direction (same as ahead for the virtual straight lane)
+        z_eol = z
+        d_eol = z_eol * cos(anglex)
 
         # No solving needed here since z is an input.
         angley_end_of_lane = atan((self.camheight-h)/d_eol) + angley # end of lane versus center
@@ -255,18 +284,8 @@ class CameraCalibration(object):
         # This gives the pixel y coordinate of the far end of the lane, at distance z.
         y_eol = centery + tan(angley_end_of_lane)*focaly
 
-        fov_y = atan((height-centery)/focaly)                   # The lower half of the field of view
         y_sol = height
 
-        # Technically, the equation giving the distance to the start of (visible) lane
-        # must be solved, because h can be dependent on the distance.
-        # So it is : d_sol = (self.camheight - h(z_sol)) / tan(fov_y - angley)
-        #     and  : z_sol = d_sol / cos(anglex)
-        if type(h) is list:
-            raise NotImplementedError('CameraCalibration.lane: height map h is not implemented.')
-        z_eol = z
-        d_sol = self.camheight / tan(fov_y - angley)
-        z_sol = d_sol / cos(anglex)       # distance from camera to sol over the ground
         # There is not need to match the car position on the road. The lane is computed as if
         # the camera was centered on it.
         delta_x_sol = z_sol * sin(anglex)

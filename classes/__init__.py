@@ -1,8 +1,6 @@
-from .CameraCalibration import CameraCalibration as cc
-from .RoadImage import RoadImage as ri
+__all__ = ["CameraCalibration", "Line", "RoadImage"] 
 
-class CameraCalibration(cc):
-    pass
-
-class RoadImage(ri):
-    pass
+# Import user-level classes into 'classes' module
+from .CameraCalibration import CameraCalibration
+from .Line import Line
+from .RoadImage import RoadImage
