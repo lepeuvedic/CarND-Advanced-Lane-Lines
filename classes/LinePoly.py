@@ -35,7 +35,8 @@ class LinePoly(Line):
         # Extract points (squeeze to avoid the third table filled with zeroes)
         y, x, _ = np.nonzero(data)
         # Limit order based on real number of points (below order 2 cuvature is zero)
-        if len(x) < 100: order = 2
+        nb_pts = len(x)
+        if nb_pts < 100: order = 2
         # Subsample data: we do not need thousands of points to find 2nd or 3rd degree polynomials...
         # Change to camera axes (and orient y in ahead direction)
         indices = np.random.randint(len(x),size=1500)  

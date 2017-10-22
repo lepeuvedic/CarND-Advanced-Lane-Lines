@@ -242,7 +242,13 @@ class CameraCalibration(object):
         # must be solved, because h can be dependent on the distance.
         # So it is : d_sol = (self.camheight - h(z_sol)) / tan(fov_y - angley)
         #     and  : z_sol = d_sol / cos(anglex)
-        if type(h) is list:
+        if type(h) is float or type(h) is int:
+            # A single number corresponds to h at distance z. h at z=0 and z=z_sol is assumed to be zero
+            pass
+        elif type(h) is tuple:
+            # A tuple of lists ( zlist, hlist ) in real world units
+            raise NotImplementedError('CameraCalibration.lane_start: height map h is not implemented.')
+        else:
             raise NotImplementedError('CameraCalibration.lane_start: height map h is not implemented.')
         d_sol = self.camheight / tan(fov_y - angley)
         z_sol = d_sol / cos(anglex)       # distance from camera to sol over the ground
@@ -278,8 +284,17 @@ class CameraCalibration(object):
         z_eol = z
         d_eol = z_eol * cos(anglex)
 
+        if type(h) is float or type(h) is int:
+            # A single number corresponds to h at distance z. h at z=0 and z=z_sol is assumed to be zero
+            h_eol = h
+        elif type(h) is tuple:
+            # A tuple of lists ( zlist, hlist ) in real world units
+            raise NotImplementedError('CameraCalibration.lane: height map h is not implemented.')
+        else:
+            raise NotImplementedError('CameraCalibration.lane: height map h is not implemented.')
+
         # No solving needed here since z is an input.
-        angley_end_of_lane = atan((self.camheight-h)/d_eol) + angley # end of lane versus center
+        angley_end_of_lane = atan((self.camheight-h_eol)/d_eol) + angley # end of lane versus center
         
         # This gives the pixel y coordinate of the far end of the lane, at distance z.
         y_eol = centery + tan(angley_end_of_lane)*focaly

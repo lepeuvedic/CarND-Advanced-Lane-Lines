@@ -2068,7 +2068,7 @@ class RoadImage(np.ndarray):
     @flatten_collection
     @static_vars(mask=None, mask_file='training/straight_mask.png', lrmask=None,
                  cspace='HLS', mini=[0.0627, 0.762, 0.75], maxi=[0.0863, 1.0,   1.0])
-    def extract_lines(self, cal=None, *, crop=None, lrmask=None):
+    def extract_lines(self, cal=None, *, crop=None, lrmask=None, mask=None):
         """
         Does color thresholding and gradients analysis in multiple colorspaces, to robustly
         extract the pixels belonging to lane lines on an image.
@@ -2090,17 +2090,16 @@ class RoadImage(np.ndarray):
         # of the lines. x,y gradient ops do this, as well as [TODO] signed gradient orientation ops.
 
         # Initialize mask
-        if RoadImage.extract_lines.mask is None:
-            mask = RoadImage(filename=RoadImage.extract_lines.mask_file)\
-                   .threshold(mini=0.5, inplace=True)
-            # Outer product of per channel thresholds with per pixel mask.
-            # The small offset on minimask ensure that it is larger than maximask on masked pixels
-            mini = np.tensordot(mask, [RoadImage.extract_lines.mini], axes=([2],[0]))+0.0001
-            maxi = np.tensordot(mask, [RoadImage.extract_lines.maxi], axes=([2],[0]))
-            RoadImage.extract_lines.mask = (mask,mini,maxi)
-            print('Loaded '+RoadImage.extract_lines.mask_file+'.')
-        else:
-            mask, mini, maxi = RoadImage.extract_lines.mask
+        if mask is None:
+            if RoadImage.extract_lines.mask is None:
+                RoadImage.extract_lines.mask = RoadImage(filename=RoadImage.extract_lines.mask_file)\
+                                       .threshold(mini=0.5, inplace=True)
+                print('Loaded '+RoadImage.extract_lines.mask_file+'.')
+            mask = RoadImage.extract_lines.mask
+        # Outer product of per channel thresholds with per pixel mask.
+        # The small offset on minimask ensure that it is larger than maximask on masked pixels
+        mini = np.tensordot(mask, [RoadImage.extract_lines.mini], axes=([2],[0]))+0.0001
+        maxi = np.tensordot(mask, [RoadImage.extract_lines.maxi], axes=([2],[0]))
 
         # TODO validate args
         # (self has 3 or 4 channels - 4th will be ignored)
@@ -2221,7 +2220,7 @@ class RoadImage(np.ndarray):
         # TODO: compute mask from curvrange and cal or from existing (past) Lines
         
         # Will not be computed if it exists already
-        filter = self.extract_lines(cal)
+        filter = self.extract_lines(cal, lrmask=None, mask=None)
         warped = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
 
         # warp_size returns the size of warped ( warped.get_size() )
@@ -2260,9 +2259,8 @@ class RoadImage(np.ndarray):
                 r_sum = np.sum(img[int(3*img.shape[0]/4):,rsearch], axis=(0,2))
                 r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+rsearch.start
 
-            print('left x0 =', l_center, '  right x0 =', r_center)
-
             lane_width = int(r_center - l_center)
+            #print('DEBUG/Line positions: left =',l_center,' right =',r_center)
 
             raw[ix].channel(1)[:] = method(img, x=l_center, lanew=lane_width, scale=scale)
             raw[ix].channel(0)[:] = method(img, x=r_center, lanew=lane_width, scale=scale)
@@ -2286,9 +2284,9 @@ class RoadImage(np.ndarray):
             l_center = self.lines.eval( ('current','left',ix), z=z_sol )  
             r_center = self.lines.eval( ('current','right',ix), z=z_sol ) 
             lane_width = r_center - l_center
-            l_center = round(img_cx + l_center / sx)
+
+            l_center = round(img_cx + l_center / sx) # Convert to pixels
             r_center = round(img_cx + r_center / sx)
-            print('left x0 =', l_center, '  right x0 =', r_center)
             
             # Draw on background image
             green = [ 0., 0.9, 0.6, 0.6 ]
@@ -2340,8 +2338,8 @@ class RoadImage(np.ndarray):
         # Ancillary subroutine to draw masks
         # ret, self, h, window_height, window_width are read from the enclosing function environment.
         def window_mask(center,level):
-            ret[int(h-(level+1)*window_height):int(h-level*window_height),
-                max(0,int(center-window_width/2)):min(int(center+window_width/2),self.shape[1])] = 1
+            ret.view(np.ndarray)[int(h-(level+1)*window_height):int(h-level*window_height),
+                max(0,int(center-window_width/2)):min(int(center+window_width/2), self.shape[1])] = 1
 
         # Trace first centroid
         window_mask(x, 0)
