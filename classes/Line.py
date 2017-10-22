@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 from abc import ABC, abstractmethod
 
 # Module variables
@@ -76,14 +77,14 @@ class Line(ABC):
 
     def __init__(self):
         # Default color is orange-yellow
-        self._color = np.array([0.9, 0.8, 0., 1.], dtype=np.float32)
+        self._color = np.array([240, 225, 0, 255], dtype=np.uint8)
         self._blink = 0
         # blink_counter is tested for equality with blink at each call of draw() and incremented
         # if not equal. If equal after incrementation, blink_state flips and blink_counter
         # is reset to zero.
         self._blink_counter = 0
         self._blink_state = True
-        self._width = 0.2           # 20 cm wide lines
+        self._width = 0.12           # 12 cm wide lines
         # Dict where geometries are stored
         self._geom = {}
         return None
@@ -139,9 +140,27 @@ class Line(ABC):
     @property
     def color(self):
         """
-        Returns the current line color as a numpy array with 4 values.
+        Returns the current line color as a numpy array with 4 integer values between 0 and 255.
         """
         return self._color
+
+    @classmethod
+    def _normalize_color(cls, color):
+        """
+        Be flexible regarding color format, but always store as numpy array of uint8.
+        """
+        color = np.array(list(color))
+        if color.dtype == np.int64:
+            if all([np.can_cast(c, np.uint8, casting='safe') for c in color]):
+                color = color.astype(np.uint8)
+            else:
+                raise ValueError('Line.color: integer RGBA color values must be in [0, 255].')
+        else:
+            # Must be float between 0 and 1
+            if color.min() < 0. or color.max() > 1.:
+                raise ValueError('Line.color: float RGBA color values must be in [0., 1.].')
+            color = np.round(color*255.).astype(np.uint8)
+        return color[:4]
     
     @color.setter
     def color(self, color):
@@ -151,18 +170,7 @@ class Line(ABC):
         blink is going to make the line blink on successive calls to draw.
         With a value of 0, the line is not blinking.
         """
-        color = np.array(list(color))
-        if self.color.dtype == int64:
-            if all([np.can_cast(c, np.uint8, casting='safe') for c in color]):
-                color = color.astype(np.uint8)
-            else:
-                raise ValueError('Line.set_color: integer RGBA color values must be in [0, 255].')
-        else:
-            # Must be float between 0 and 1
-            if color.min() < 0. or color.max() > 1.:
-                raise ValueError('Line.set_color: float RGBA color values must be in [0., 1.].')
-            color = np.round(color*255.).astype(np.uint8)
-        self._color = color
+        self._color = Line._normalize_color(color)
         return
 
     @property
@@ -184,7 +192,7 @@ class Line(ABC):
         """
         Returns the width of the painted lane line in world units.
         """
-        return _width
+        return self._width
 
     @width.setter
     def width(self, val):
@@ -195,51 +203,81 @@ class Line(ABC):
             raise ValueError('Line.width: width must be strictly positive.')
         self._width = val
         
-    def draw(self, key, image, *, origin, scale):
+    def draw(self, key, image, *, origin, scale, color=None, width=None, warp=None, unwarp=None):
         """
         Draws a smooth graphical representation of the lane line in an image, taking into 
         account origin and scale.
         If image is not warped, the line is drawn in a warped buffer, then unwarped and alpha
         blended into the image.
-        image is undistorted if it has not been done already.
-        A new image is returned.
+        Returns None: the line is drawn in image.
         """
         # Blink processing
-        if self.blink_counter < self.blink:
-            self.blink_counter += 1
-            if self.blink_counter == self.blink:
-                self.blink_state = not(self.blink_state)
-                self.blink_counter = 0
+        if self._blink_counter < self._blink:
+            self._blink_counter += 1
+            if self._blink_counter == self._blink:
+                self._blink_state = not(self._blink_state)
+                self._blink_counter = 0
+                
+        if not(self._blink_state):
+            return
+        
         # Create buffer
+        # Make a fresh road image buffer from image
+        buffer = np.zeros_like(image, subok=True)
         if not(image.warped):
+            if warp is None or unwarp is None:
+                raise ValueError('Line.draw: warp and unwarp function handles must be provided to work on unwarped image.')
             # Create a warped buffer
-            raise NotImplementedError('NYI')
-        else:
-            # Make a fresh road image buffer from image
-            base = image.shape[-1]
-            buffer = np.zeros_like(image, subok=True)
-        height, width, nb_ch = buffer.shape
+            buffer = warp(buffer)
+
+        height, _, nb_ch = buffer.shape
+        
+        # Color and width processing
+        if color is None: color = self.color
+        else:             color = Line._normalize_color(color)
+        color = color[:nb_ch]/255.
+        if width is None: width = self.width
         
         # Call eval with key to get lane line skeleton in world coordinates
         sx,sy = scale
         x0,y0 = origin     # (out of image) pixel coordinates of camera location
 
         rng = range(0, height, int(2./sy))  # one segment every 2 meters
-        z = sy * (y0 - np.array([height-y for y in rng], dtype=np.float32))
+        z = sy * np.array([(y0-height)+y for y in rng], dtype=np.float32)
         x = self.eval(key,z=z)
         
         # Compute pixel coordinates using sx,sy and origin
         x = x0 + x/sx
-        y = y0 - y/sy
-
+        y = y0 - z/sy
+            
         # Plot as polygon
         # fillConvexPoly is able to handle any poly which crosses at most 2 times each scan line
         # and does not self-intersect. Ours is a function and fits the definiion.
         # We work with antialiasing and 3 bits of subpixels: every coordinate is multplied by 8
-        thick = int(8 * self._width / sx / 2.)
-        points_up = [ [int(8 * xi - thick), int(8 * yi)] for xi,yi in zip(x,y) ]
-        points_dn = [ [int(8 * xi + thick), int(8 * yi)] for xi,yi in zip(x,y) ]
+        shift=3
+        thick = int(2**shift * width / sx / 2.)
+        points_up = [ [int(2**shift * xi - thick), int(2**shift * yi)] for xi,yi in zip(x,y) ]
+        points_dn = [ [int(2**shift * xi + thick), int(2**shift * yi)] for xi,yi in zip(x,y) ]
         points_dn.reverse()
-        pts = points_up + points_dn
-        cv2.fillConvexPoly(buffer, pts, self._color, cv2.AA, shift=3)
-        #cv2.line(img, (x1, y1), (x2, y2), color, thickness)
+        pts = np.array(points_up + points_dn, dtype=np.int32)
+
+        cv2.fillConvexPoly(buffer, pts, color=list(color), shift=shift, lineType=cv2.LINE_AA)
+        if nb_ch == 4:
+            # image, buffer have depth 4
+            # Alpha blend buffer
+            # buffer contains RGBA data, with per pixel alpha
+            alpha = buffer.channel(3).to_float()
+        else:
+            # Assume alpha is self._color[3] where buffer has _color
+            alpha = np.amax(buffer.to_float(), axis=2, keepdims=True)
+            if len(self.color)>=4:   alphaval = self.color[3]/255.
+            else:                    alphaval = 1.0
+            alpha[(alpha>0.0)] = alphaval
+
+        if not(image.warped):
+            buffer = unwarp(buffer)
+            alpha = unwarp(alpha)
+            
+        image *= (1-alpha)
+        image += (alpha*buffer)
+        return None

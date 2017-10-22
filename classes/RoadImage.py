@@ -155,10 +155,7 @@ class RoadImage(np.ndarray):
         # New instance, create new blank instances of Line from default Factory
         # The program can set the default line at any time.
         # Built from another road image: same family share the instances.
-        self.farleft  = getattr(obj, 'farleft', Line.Factory())
-        self.left     = getattr(obj, 'left', Line.Factory())
-        self.right    = getattr(obj, 'right', Line.Factory())
-        self.farright = getattr(obj, 'farright', Line.Factory())
+        self.lines    = getattr(obj, 'lines', Line.Factory())
         return
         
     def __array_finalize__(self, obj):
@@ -259,12 +256,17 @@ class RoadImage(np.ndarray):
                 self.crop_area = (tuple(coords1[-3:]),tuple(coords2[-3:]))
                 
                 if coords1 == [0]*len(coords1) and coords2 == list(obj.shape):
-                    # For a reshape, coords1 == [0,0,...] and coords2 == list(obj.shape). It is never a crop.
+                    # For a reshape, coords1 == [0,0,...] and coords2 == list(obj.shape).
+                    # It is never a crop, but we can also have eliminated the G channel in an RGB image.
                     # Because we handle images, we must ensure that the last three dimensions are the same
                     if self.shape[-3:] != obj.shape[-3:]:
                         if self.ndim == 1:
                             # Allow ravel()
                             op = ((np.ravel,),)
+                        elif self.shape[-3:-1] == obj.shape[-3:-1] and self.strides[-3:-1] == obj.strides[-3:-1]:
+                            # It's a channels operation which kept the first and last channels and eliminated at last one
+                            # The step can be deduced from the number of channels in obj and self. The // is exact.
+                            op = ((RoadImage.channels, range(0,obj.shape[-1],(obj.shape[-1]-1)//(self.shape[-1]-1))),)
                         else:
                             raise NotImplementedError('RoadImage.__array_finalize__ BUG: '
                                                       +'Bad reshape operation done by caller' )
@@ -276,8 +278,12 @@ class RoadImage(np.ndarray):
                     # The width and height strides are the same: it's a crop, maybe with a channels()
                     if coords1[-1] == 0 and coords2[-1] == obj.shape[-1]:
                         op = ((RoadImage.crop, self.crop_area),)
-                    else:
+                    elif self.strides[-1] == obj.strides[-1] or self.shape[-1]==1:
+                        # Extraction of contiguous channels, with or without a crop, and maybe just 1 channel.
                         op = ((RoadImage.crop, self.crop_area),(RoadImage.channels,coords1[-1],coords2[-1]))
+                    else:
+                        raise NotImplementedError('RoadImage.__array_finalize__ BUG: '
+                                                  +'Bad reshape operation done by caller' )
                 elif np.prod(np.array(coords2)-np.array(coords1)) == self.size:
                     # Dense selection: the crop information captures it all.
                     if coords1[-1] == 0 and coords2[-1] == obj.shape[-1]:
@@ -1730,9 +1736,12 @@ class RoadImage(np.ndarray):
 
         return dsize, -img_width[0]
 
+    def unwarp(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001)):
+        return self.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange, _unwarp=True)
+
     @generic_search()
     @flatten_collection
-    def warp(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.002, 0.002)):
+    def warp(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), _unwarp=False):
         """
         Returns an image showing the road as seen from above.
         Imput image must be a camera image shape whose size matches cal.get_size().
@@ -1745,9 +1754,13 @@ class RoadImage(np.ndarray):
         the first parameter should be negative, the second positive in 1/meter.
         """
         # TODO: rectangle should have 2D space coordinates for a 3D mapping
-        if self.get_size() != cal.get_size():
-            raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
-
+        if _unwarp:
+            if not(self.warped): raise ValueError('RoadImage.warp: Can only unwarp warped images.')
+        else:
+            if self.warped:      raise ValueError('RoadImage.warp: Image is already warped.')
+            if self.get_size() != cal.get_size():
+                raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
+        
         lcurv, rcurv = curvrange
         sx, sy = scale
 
@@ -1757,16 +1770,30 @@ class RoadImage(np.ndarray):
         # Compute new rectangle coordinages in pixels, fitting inside dsize
         rect = np.array([ [x / sx + img_cx, dsize[1] - (y - z_sol) / sy ]
                           for x,y in rectangle ], dtype=np.float32)
-
-        ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype)\
-            .view(RoadImage)
-
+        
         persp_mat = cv2.getPerspectiveTransform(np.array(trapeze, dtype=np.float32),rect)
 
-        for ix,img in enumerate(self):
-            cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
+        # Storage for results
+        if _unwarp:
+            if self.get_size() != dsize:
+                raise ValueError('RoadImage.unwarp: Image size does not match size given by RoadImage.warp_size().')
+            dsize = cal.get_size()
+            
+        # Arbitrary shape, but default initialization of attributes
+        ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype)\
+                .view(RoadImage)
+        ret._inherit_attributes(self)   # Copy most attributes not affected by warping 
 
-        ret.warped = True
+        if _unwarp:
+            for ix,img in enumerate(self):
+                cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix],
+                                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+            ret.warped = False
+        else:
+            for ix,img in enumerate(self):
+                cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
+            ret.warped = True
+
         return ret
 
     @strict_accepts(object, tuple)
@@ -2191,44 +2218,101 @@ class RoadImage(np.ndarray):
         x pixel coordinate of the left lane line, and pixel[0,1] is the x pixel coordinate
         of the right lane line.
         """
-        # TODO: compute mask from curvrange and cal
+        # TODO: compute mask from curvrange and cal or from existing (past) Lines
         
         # Will not be computed if it exists already
         filter = self.extract_lines(cal)
         warped = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+
         # warp_size returns the size of warped ( warped.get_size() )
         # and the x position of the camera. They are optimized as a function of curvrange.
+        # The way images are framed depends only on curvrange, so all the images in the
+        # collection yield warped images framed in exactly the same way. origin is the same.
         dsize, img_cx = RoadImage.warp_size(cal, z=z, h=h, scale=scale, curvrange=curvrange)
-        w,h = dsize
-        sx = scale[0]
-        # Allocate space for results, copying the input image in the blue channel
-        ret = warped.channels(range(-2,1), isview=False)
+        width,height = dsize
+        sx, sy = scale
+        o = (img_cx, z/sy)
+        z_sol = z - height * sy
+        
+        # Allocate space for results, copying the input image in the blue (3rd) channel
+        raw = warped.channels(range(-2,1), isview=False)
+        # Reassign RGB colorspace to display raw lines in blue
+        raw.colorspace = 'RGB'
+        
+        #ret = np.zeros_like(self, dtype=np.float32)
+        ret = self.to_float()
 
         window_width = 30 
         window = np.ones(window_width) # Create our window template that we will use for convolutions
 
         # From the camera position, the search zone for line lanes extends from 0.5m to 3.6m
         lsearch = range(max(0, int(img_cx - 3.6 / sx)), max(window_width, int(img_cx - 0.5 / sx)))
-        rsearch = range(min(w-window_width, int(img_cx + 0.5 / sx)), min(w, int(img_cx + 3.6 / sx)))
+        rsearch = range(min(width-window_width, int(img_cx + 0.5 / sx)), min(width, int(img_cx + 3.6 / sx)))
 
+        lane_width = None # Implies that l_center and r_center are undefined.
+        
         for ix, img in enumerate(warped):
-            
-            # Sum quarter bottom of image to get slice, could use a different ratio
-            l_sum = np.sum(img[int(3*img.shape[0]/4):,lsearch], axis=(0,2))
-            l_center = np.argmax(np.convolve(window,l_sum))-window_width/2+lsearch.start
-            r_sum = np.sum(img[int(3*img.shape[0]/4):,rsearch], axis=(0,2))
-            r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+rsearch.start
+
+            if lane_width is None:
+                # Sum quarter bottom of image to get slice, could use a different ratio
+                l_sum = np.sum(img[int(3*img.shape[0]/4):,lsearch], axis=(0,2))
+                l_center = np.argmax(np.convolve(window,l_sum))-window_width/2+lsearch.start
+                r_sum = np.sum(img[int(3*img.shape[0]/4):,rsearch], axis=(0,2))
+                r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+rsearch.start
 
             print('left x0 =', l_center, '  right x0 =', r_center)
-            width = int(r_center - l_center)
-            ret[ix].channel(1)[:] = method(warped[ix], x=l_center, line=self.left,
-                                           lanew=width, scale=scale)
-            ret[ix].channel(0)[:] = method(warped[ix], x=r_center, line=self.right,
-                                           lanew=width, scale=scale)
 
+            lane_width = int(r_center - l_center)
+
+            raw[ix].channel(1)[:] = method(img, x=l_center, lanew=lane_width, scale=scale)
+            raw[ix].channel(0)[:] = method(img, x=r_center, lanew=lane_width, scale=scale)
+            
+            # Extract line geometry
+            self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
+            self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)), origin=o, scale=scale)
+
+            # Use undistorted, warped input image as background for results (uncomment to use)
+            # Option 1: use warped image as background
+            #backgnd = self[ix].warp(cal, z=z, h=h, scale=scale, curvrange=curvrange).to_float()
+            # Option 2: use a black background to observe only the graphics
+            #backgnd = np.zeros(shape=img.shape[:2]+(self.shape[-1],), dtype=np.float32).view(RoadImage)
+            #backgnd._inherit_attributes(img)    # Shape of warped img, but nb_channels and dtype of camera image (self).
+
+            # Blend left and right to get median line
+            self.lines.blend( ('current','lane',ix), key1=('current','left',ix), key2=('current','right',ix),
+                              op='wavg', w2=0.5 )
+
+            # Measure lane width
+            l_center = self.lines.eval( ('current','left',ix), z=z_sol )  
+            r_center = self.lines.eval( ('current','right',ix), z=z_sol ) 
+            lane_width = r_center - l_center
+            l_center = round(img_cx + l_center / sx)
+            r_center = round(img_cx + r_center / sx)
+            print('left x0 =', l_center, '  right x0 =', r_center)
+            
+            # Draw on background image
+            green = [ 0., 0.9, 0.6, 0.6 ]
+            def _warp(img):
+                return img.warp(  cal, z=z, h=h, scale=scale, curvrange=curvrange)
+            
+            def _unwarp(img):
+                return img.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+            backgnd = ret[ix]  # Comment this out to draw on warped images (select background above)
+            self.lines.draw( ('current','lane',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
+                             width=lane_width, color=green)
+            self.lines.draw( ('current','left',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
+            self.lines.draw(('current','right',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
+
+            # To see warped results: erase intermediate results stored in raw, and uncomment 'return raw' below
+            #np.copyto(raw[ix], backgnd, casting='equiv')
+
+        # To see unwarped without the background image, replace ret
+        #ret = raw.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+
+        #return raw
         return ret
     
-    def centroids(self, *, x, line, lanew, scale):
+    def centroids(self, *, x, lanew, scale):
         """
         'centroids' is called by find_lines() on a single image of a flattened collection.
         The returned image is RGB, with the warped B&W image as blue, the left lane line as green, 
