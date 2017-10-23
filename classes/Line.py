@@ -130,13 +130,20 @@ class Line(ABC):
         self._geom[key] = self._geom[key2]
 
     @abstractmethod
-    def eval(self, key, *, z):
+    def eval(self, key, *, z, der=0):
         """
         Computes real world x coordinates associated to z coordinates supplied as a numpy array.
         z coordinates are distances from the camera.
         """
         raise NotImplementedError('Line.move: Class Line is not intended to be used directly.')
 
+    def curvature(self, key, *, z):
+        """
+        Returns the signed curvature. Positive means right turn, negative left turn, zero straight.
+        The radius of curvature is the inverse of the curvature.
+        """
+        return self.eval(key, z=z, der=2)/abs(1+self.eval(key, z=z, der=1)**2)**1.5
+    
     @property
     def color(self):
         """
@@ -211,6 +218,20 @@ class Line(ABC):
         blended into the image.
         Returns None: the line is drawn in image.
         """
+        height, _, nb_ch = image.shape
+        sx,sy = scale
+        try:
+            # retrieve 'zmax'
+            z_max = self._geom[key]['zmax']
+        except KeyError:
+            z_max = sy * height
+
+        try:
+            # retrieve 'dens'
+            density = self._geom[key]['dens']
+        except KeyError:
+            density = 1
+            
         # Blink processing
         if self._blink_counter < self._blink:
             self._blink_counter += 1
@@ -218,7 +239,9 @@ class Line(ABC):
                 self._blink_state = not(self._blink_state)
                 self._blink_counter = 0
                 
-        if not(self._blink_state):
+        # Enable blinking line if there are dashes
+        if density > 0.6: self.blink = 9
+        elif not(self._blink_state):
             return
         
         # Create buffer
@@ -230,8 +253,6 @@ class Line(ABC):
             # Create a warped buffer
             buffer = warp(buffer)
 
-        height, _, nb_ch = buffer.shape
-        
         # Color and width processing
         if color is None: color = self.color
         else:             color = Line._normalize_color(color)
@@ -239,10 +260,9 @@ class Line(ABC):
         if width is None: width = self.width
         
         # Call eval with key to get lane line skeleton in world coordinates
-        sx,sy = scale
         x0,y0 = origin     # (out of image) pixel coordinates of camera location
 
-        rng = range(0, height, int(2./sy))  # one segment every 2 meters
+        rng = range(0, int(z_max/sy), int(2./sy))  # one segment every 2 meters
         z = sy * np.array([(y0-height)+y for y in rng], dtype=np.float32)
         x = self.eval(key,z=z)
         

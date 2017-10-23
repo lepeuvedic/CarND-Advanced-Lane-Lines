@@ -2249,6 +2249,8 @@ class RoadImage(np.ndarray):
         rsearch = range(min(width-window_width, int(img_cx + 0.5 / sx)), min(width, int(img_cx + 3.6 / sx)))
 
         lane_width = None # Implies that l_center and r_center are undefined.
+        green = np.array([ 0., 0.9, 0.6, 0.6 ])
+        red = np.array([ 1., 0.1, 0., 0.5 ])
         
         for ix, img in enumerate(warped):
 
@@ -2265,9 +2267,9 @@ class RoadImage(np.ndarray):
             raw[ix].channel(1)[:] = method(img, x=l_center, lanew=lane_width, scale=scale)
             raw[ix].channel(0)[:] = method(img, x=r_center, lanew=lane_width, scale=scale)
             
-            # Extract line geometry
-            self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
-            self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)), origin=o, scale=scale)
+            # Extract line geometry: returns line "density" (i.e dashes or solid) and maximum z achieved for fitting
+            ldens, lz = self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
+            rdens, rz = self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)), origin=o, scale=scale)
 
             # Use undistorted, warped input image as background for results (uncomment to use)
             # Option 1: use warped image as background
@@ -2279,25 +2281,45 @@ class RoadImage(np.ndarray):
             # Blend left and right to get median line
             self.lines.blend( ('current','lane',ix), key1=('current','left',ix), key2=('current','right',ix),
                               op='wavg', w2=0.5 )
-
+            # Measure curvature
+            curvature = self.lines.curvature( ('current','lane',ix) , z=z_sol)
+            
             # Measure lane width
             l_center = self.lines.eval( ('current','left',ix), z=z_sol )  
             r_center = self.lines.eval( ('current','right',ix), z=z_sol ) 
             lane_width = r_center - l_center
 
+            backgnd = ret[ix]  # Comment this out to draw on warped images (select background above)
+            cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+            cv2.putText(backgnd,"%0.2f" % r_center, (int(640 + 100*lane_width/2 - 135), 55),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+            cv2.line(backgnd,(int(640 - 100*lane_width/2), 70),(int(640 + 100*lane_width/2), 70),
+                     color=green, thickness=2)
+            cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=green, thickness=2)
+            if curvature > 0.0005:
+                cv2.putText(backgnd,"R=%4d m" % int(1/curvature), (860,250),
+                            fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+            elif curvature < -0.0005:
+                cv2.putText(backgnd,"R=%4d m" % int(-1/curvature), (100,250),
+                            fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                
+            
             l_center = round(img_cx + l_center / sx) # Convert to pixels
             r_center = round(img_cx + r_center / sx)
             
             # Draw on background image
-            green = [ 0., 0.9, 0.6, 0.6 ]
+            z_max = (min(lz,rz)-20) / (z-20)      # ratio of achieved z to desired z (full red at 20 m)
+            if z_max < 0: z_max=0
+            color = green * z_max + red * (1-z_max)
             def _warp(img):
                 return img.warp(  cal, z=z, h=h, scale=scale, curvrange=curvrange)
             
             def _unwarp(img):
                 return img.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
-            backgnd = ret[ix]  # Comment this out to draw on warped images (select background above)
+            
             self.lines.draw( ('current','lane',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
-                             width=lane_width, color=green)
+                             width=lane_width, color=color)
             self.lines.draw( ('current','left',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
             self.lines.draw(('current','right',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
 
