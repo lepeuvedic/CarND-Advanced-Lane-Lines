@@ -91,7 +91,7 @@ class LinePoly(Line):
             z_inflex = -p[1]/(3*p[0])
             z_max *= 0.9
             
-        if z_max <= y0/2:
+        if nb_pts < 100 or z_max <= y0/2:
             #print("Order 2 forced, inflexion at", sy*z_inflex,"m. Nb pts =",nb_pts)
             p = np.sum( p_ for p_ in genpoly(20,x,y,y0/2,2) ) / 20
             p = [ 0 ] + p  # Add 0 for order 3.
