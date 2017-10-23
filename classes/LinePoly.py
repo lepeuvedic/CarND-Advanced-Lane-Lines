@@ -74,17 +74,17 @@ class LinePoly(Line):
 
         _, y0 = origin
         sx, sy = scale
-        if nb_pts >= 100: 
-            # Average 10 random samples of 150 points
-            p = np.sum( p_ for p_ in genpoly(10,x,y,y0,3) ) / 10
-            # Compute distance to inflexion point (with 3rd degree)
-            z_inflex = p[1]/(3*p[0])
-        else:
-            z_inflex = 0  # force order 2
+        # if nb_pts >= 100: 
+        #     # Average 10 random samples of 150 points
+        #     p = np.sum( p_ for p_ in genpoly(10,x,y,y0,3) ) / 10
+        #     # Compute distance to inflexion point (with 3rd degree)
+        #     z_inflex = p[1]/(3*p[0])
+        # else:
+        #     z_inflex = 0  # force order 2
 
         z_max = y0
         z_inflex = 0
-        while z_max>y0/2 and z_inflex<z_max:
+        while z_max>y0/2 and z_inflex<z_max and z_inflex>=0 and nb_pts >= 100:
             # Average 10 random samples of 150 points
             p = np.sum( p_ for p_ in genpoly(10,x,y,z_max,3) ) / 10
             # Compute distance to inflexion point (with 3rd degree)
@@ -94,6 +94,7 @@ class LinePoly(Line):
         if z_max <= y0/2:
             #print("Order 2 forced, inflexion at", sy*z_inflex,"m. Nb pts =",nb_pts)
             p = np.sum( p_ for p_ in genpoly(20,x,y,y0/2,2) ) / 20
+            p = [ 0 ] + p  # Add 0 for order 3.
             
         # Scale to real world x = p[0] * y**3 + p[1] * y**2 + p[2] * y + p[3]
         # X,Y real world coords. X = x*sx, Y = y*sy and X = P[0] * Y**3 + ... + P[3]. Gives formula.
