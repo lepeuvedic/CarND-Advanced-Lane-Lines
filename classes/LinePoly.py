@@ -63,6 +63,9 @@ class LinePoly(Line):
                 sel = (y>y0-z)
                 xf = x[sel]
                 yf = y[sel]
+                if(len(xf)<order+1):
+                    raise ValueError('LinePoly.estimate.genpoly: z too low (%0.1f) leaves too few points (%d/%d).'
+                                     % (z, len(xf), nb_pts))
                 indices = np.random.randint(len(xf),size=150)  
                 x_ = xf[indices] - x0
                 y_ = y0 - yf[indices]
@@ -74,24 +77,21 @@ class LinePoly(Line):
 
         _, y0 = origin
         sx, sy = scale
-        # if nb_pts >= 100: 
-        #     # Average 10 random samples of 150 points
-        #     p = np.sum( p_ for p_ in genpoly(10,x,y,y0,3) ) / 10
-        #     # Compute distance to inflexion point (with 3rd degree)
-        #     z_inflex = p[1]/(3*p[0])
-        # else:
-        #     z_inflex = 0  # force order 2
 
         z_max = y0
         z_inflex = 0
-        while z_max>y0/2 and z_inflex<z_max and z_inflex>=0 and nb_pts >= 100:
-            # Average 10 random samples of 150 points
-            p = np.sum( p_ for p_ in genpoly(10,x,y,z_max,3) ) / 10
-            # Compute distance to inflexion point (with 3rd degree)
-            z_inflex = -p[1]/(3*p[0])
-            z_max *= 0.9
+        fail3 = False
+        try:
+            while z_max>y0/2 and z_inflex<z_max and z_inflex>=0 and nb_pts >= 100:
+                # Average 10 random samples of 150 points
+                p = np.sum( p_ for p_ in genpoly(10,x,y,z_max,3) ) / 10
+                # Compute distance to inflexion point (with 3rd degree)
+                z_inflex = -p[1]/(3*p[0])
+                z_max *= 0.9
+        except ValueError:
+            fail3 = True
             
-        if nb_pts < 100 or z_max <= y0/2:
+        if nb_pts < 100 or z_max <= y0/2 or fail3:
             #print("Order 2 forced, inflexion at", sy*z_inflex,"m. Nb pts =",nb_pts)
             p = np.sum( p_ for p_ in genpoly(20,x,y,y0/2,2) ) / 20
             p = [ 0 ] + p  # Add 0 for order 3.
