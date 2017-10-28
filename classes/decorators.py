@@ -261,11 +261,16 @@ def generic_search(unlocked = False):
                 if not(ret is None): return ret
                 # Recalculate
                 ret = f(self,*args, **kwargs)
-                # f may return ret = self if nothing to do.
-                # In this case, there is no new child to reference
-                if not(ret is self):
-                    # Store in cache
-                    self.__add_child__(ret, op, unlocked)
+
+                if not(ret is None):
+                    # When a method returns several elements, the image is the first
+                    if type(ret) is tuple:     child = ret[0]
+                    else:                      child = ret
+                    # f may return ret = self if nothing to do.
+                    # In this case, there is no new child to reference
+                    if not(child is self):
+                        # Store in cache
+                        self.__add_child__(child, op, unlocked)
             return ret
         return gsearch_wrapper
     return gsearch
@@ -285,7 +290,7 @@ def flatten_collection(f):
         # Put the collection back in the original shape
         if type(ret) is tuple:
             ret = tuple([ x.reshape(self.shape[:-3]+x.shape[1:]) for x in list(ret)])
-        else:
+        elif issubclass(type(ret),numpy.ndarray):
             ret = ret.reshape(self.shape[:-3]+ret.shape[1:])
         # reshape sets ret.crop_area to full image size
         return ret
@@ -341,3 +346,134 @@ def static_vars(**kwargs):
         return func
     return wrap_static_vars
 
+
+# class filter(object):
+#     """
+#     The basic filter implementation.
+#     """
+#     def __init__(**kwargs):
+#         # Store parameters
+#         for k in kwargs:
+#             setattr(self,k,kwargs[k])
+#         # Declare state vars
+        
+#     def __call__(self,x):
+#         # compute x as a function of state vars
+#         # and parameters 
+#         return x
+
+# # Could also be a static variable with static vars, but only
+# # if a single instance is needed.
+# def filter_function(x):
+#     return x
+
+# A decorator class
+# which decorates a property instance
+class smooth(object):
+    """
+    @smooth can decorate real valued data, and will filter
+    them. It is applied to a property.
+
+    @smooth(filter,clock)
+    @property
+    def my_prop(self):
+        return self._my_prop
+
+    @my_prop.setter
+    def my_prop(self, val):
+        self._my_prop = val
+
+    """
+    # Called once and first with decorator arguments
+    # when creating the instance in the owner class.
+    def __init__(self, filter, clock='set'):
+
+        from weakref import WeakSet
+
+        self._filterout = None
+        self._property = None
+        self.filter = filter
+        # built-in clock
+        self._subscribers = WeakSet()
+        self.time = 0
+        self._setclk = False
+        self._getclk = False
+
+    def register(self, callable):
+        """
+        Clock interface: register() and optionally tick()
+        Any callable supporting x(time) can be registered.
+        """
+        self._subscribers.add(callable)
+
+    def tick(self):
+        for cb in self._subscribers:
+            cb(self.time)
+        self.time += 1
+
+    def setter(self,f):
+        return self._property.setter(f)
+    
+    def deleter(self,f):
+        return self._property.deleter(f)
+    
+    # Called once to replace property getter with our own
+    def __call__(self, prop):
+
+        def callback(self,time):
+            val = self._property.__get__(instance, owner)
+            out = self.filter(val)
+            setattr(instance, self._filterout, out)
+            return None
+        
+        try:
+            clock.register(callback)
+        except AttributeError:
+            if clock=='set':
+                self.register(lambda time: self.callback(time))
+                self._setclk = True
+            elif clock=='get':
+                self.register(lambda time: self.callback(time))
+                self._getclk = True
+            else:
+                # A clock source supports clock.register(callable) and clock.tick().
+                raise TypeError('@smooth: clock must be a clock source')
+            clock = self
+            self.register(callback)
+        # Can synchronize several filters using the clock from one
+        # Maybe clock should be a property? Don't change it!
+        self.clock = clock
+
+        if not issubclass(type(prop),property):
+            raise TypeError('@smooth can only be used on @property')
+        # save name in descriptor instance
+        self._filterout = '_'+str(abs(hash(prop)))+'_out'
+        # capture ref of property object
+        self._property = prop
+        # return another property: self
+        return self
+
+    # The two methods below are called when reading or writing
+    # the smooth attribute.
+    def __get__(self, instance, owner):
+        """
+        Called when y = instance.x
+        In principle does : return instance.x
+        however 'x' must be derived from the name of the function
+        we decorate.
+        """
+        if self._getclk: self.tick()
+        return getattr(instance, self._filterout)
+    
+    def __set__(self, instance, value):
+        """
+        Called when instance.x = x0
+        """
+        print('in smooth.__set__',value)
+        self._property.__set__(instance, value)  # crée un ou plusieurs attributs dans instance
+        if self._setclk: self.tick()
+
+    def __delete__(self, instance):
+        delattr(instance, self._filterout)
+        self._property.__delattr__(instance)
+        

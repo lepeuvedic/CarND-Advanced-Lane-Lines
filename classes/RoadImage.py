@@ -10,6 +10,12 @@ from .decorators import _make_hashable, static_vars
 from .CameraCalibration import CameraCalibration
 from .Line import Line
 from .LinePoly import LinePoly
+import itertools
+from functools import partial
+from threading import current_thread
+
+class _Record(object):
+    pass
 
 class RoadImage(np.ndarray):
 
@@ -126,8 +132,10 @@ class RoadImage(np.ndarray):
             v = np.broadcast_to(self, bcast.shape)  # returns a numpy.ndarray
             maxi = v.max()
             mini = v.min()
+            if maxi.dtype == np.float32: epsilon = 10. * np.finfo(type(maxi)).eps
+            else: epsilon = 1
             if not(np.isfinite(maxi) and np.isfinite(mini)) or\
-               not(mini == maxi or mini == 0 or abs(mini+maxi)<10.*np.finfo(type(maxi)).eps):
+               not(mini == maxi or mini == 0 or abs(mini+maxi)<epsilon):
                 # It implies that the max or the min is not in the set { -1, 0 , 1 }.
                 self.binary = False
             else:
@@ -151,11 +159,14 @@ class RoadImage(np.ndarray):
         self.gradient = getattr(obj, 'gradient', False)       # True for a gradient image: inherited
         self.undistorted = getattr(obj, 'undistorted', False) # True for undistorted images
         self.filename = getattr(obj, 'filename', None)        # filename is inherited
-        
+
         # New instance, create new blank instances of Line from default Factory
         # The program can set the default line at any time.
         # Built from another road image: same family share the instances.
         self.lines    = getattr(obj, 'lines', Line.Factory())
+        # Current data of find_lines is also shared in a family
+        self.find_lines_data = getattr(obj, 'find_lines_data', _Record())
+
         return
         
     def __array_finalize__(self, obj):
@@ -967,10 +978,18 @@ class RoadImage(np.ndarray):
             raise ValueError('RoadImage.save: attempt to save into original file %s.' % filename)
         nb_ch = RoadImage.image_channels(self)
         if not(nb_ch in [1,3,4]):
-            raise ValueError('RoadImage.show: Can only save single channel, RGB or RGBA images.')
+            raise ValueError('RoadImage.save: Can only save single channel, RGB or RGBA images.')
         flat = self.flatten()
         if flat.shape[0] != 1:
-            raise ValueError('RoadImage.show: Can only save single images.')
+            raise ValueError('RoadImage.save: Can only save single images.')
+        if flat.binary:
+            if flat.dtype == np.float32 and flat.gradient:
+                flat = flat.to_int()  # convert to int8
+            if flat.dtype == np.int8:
+                # Won't save signed
+                flat = np.uint8(flat * 64)  # -1 -> 192, 1 -> 64, 0 -> 0
+            elif flat.dtype == np.uint8 :
+                flat = flat*255
         if flat.shape[3] == 1:
             mpimg.imsave(filename, flat.view(np.ndarray)[0,:,:,0], format=format)
         else:
@@ -1172,9 +1191,11 @@ class RoadImage(np.ndarray):
         rgb() is recorded as a channels() operation.
         """
         try:
-            return self.channels(range(0-n,3-n))
+            ret = self.channels(range(0-n,3-n))
         except ValueError:
-            return self.channels(range(0-n,3-n), isview=False)
+            ret = self.channels(range(0-n,3-n), isview=False)
+        ret.colorspace='RGB'
+        return ret
     
     # Operations which generate a new road image. Unlike the constructor and copy, those functions store handles to
     # newly created RoadImages in the self.children dictionary, and memorize the source image as parent.
@@ -1448,11 +1469,11 @@ class RoadImage(np.ndarray):
                 
                 if 'x' in tasks:
                     index = tasks.index('x')
-                    grads[index][img,:,:,ch] = derx
+                    grads[index][img].channel(ch)[:] = np.expand_dims(derx,2)
     
                 if 'y' in tasks:
                     index = tasks.index('y')
-                    grads[index][img,:,:,ch] = dery 
+                    grads[index][img].channel(ch)[:] = np.expand_dims(dery,2) 
     
                 if ('mag' in tasks) or ('angle' in tasks):
                     # Calculate the magnitude (also used by 'angle' below)
@@ -1736,14 +1757,15 @@ class RoadImage(np.ndarray):
 
         return dsize, -img_width[0]
 
-    def unwarp(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001)):
+    def unwarp(self, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001)):
+        cal = self._retrieve_cal()
         return self.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange, _unwarp=True)
 
     @generic_search()
     @flatten_collection
     def warp(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), _unwarp=False):
         """
-        Returns an image showing the road as seen from above.
+        Returns an image showing the road as seen from above and the location of the camera in 2D (in pixel).
         Imput image must be a camera image shape whose size matches cal.get_size().
         cal is a CameraCalibration instance. It must be parameterized correctly using 
         cal.set_camera_height(h) and cal.set_ahead(x,y,z).
@@ -1754,24 +1776,36 @@ class RoadImage(np.ndarray):
         the first parameter should be negative, the second positive in 1/meter.
         """
         # TODO: rectangle should have 2D space coordinates for a 3D mapping
+        offsets=None
         if _unwarp:
             if not(self.warped): raise ValueError('RoadImage.warp: Can only unwarp warped images.')
+            offsets=(0,0)   # Unwarp always unwarps to original camera image size, you can crop again if needed.
         else:
             if self.warped:      raise ValueError('RoadImage.warp: Image is already warped.')
-            if self.get_size() != cal.get_size():
-                raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
+            if self.get_size() == cal.get_size():
+                offsets=(0,0)
+            else:
+                for p in self.parents():
+                    if p.get_size() == cal.get_size():
+                        offsets = self.get_crop(p)[0]  # keep (x1,y1)
+                        break
+        if offsets is None:
+            raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
         
         lcurv, rcurv = curvrange
         sx, sy = scale
 
         trapeze, rectangle, z_sol = cal.lane(z=z,h=h)
         dsize, img_cx = RoadImage.warp_size(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+        origin = np.repeat(np.array([[img_cx, z/sy]], dtype=np.int), self.shape[0], axis=0)
         
         # Compute new rectangle coordinages in pixels, fitting inside dsize
         rect = np.array([ [x / sx + img_cx, dsize[1] - (y - z_sol) / sy ]
                           for x,y in rectangle ], dtype=np.float32)
+        # Compute new trapeze coordinates taking into accoung crop
+        trap = np.array(trapeze, dtype=np.float32) - np.array(offsets, dtype=np.float32)
         
-        persp_mat = cv2.getPerspectiveTransform(np.array(trapeze, dtype=np.float32),rect)
+        persp_mat = cv2.getPerspectiveTransform(trap, rect)
 
         # Storage for results
         if _unwarp:
@@ -1779,7 +1813,7 @@ class RoadImage(np.ndarray):
                 raise ValueError('RoadImage.unwarp: Image size does not match size given by RoadImage.warp_size().')
             dsize = cal.get_size()
             
-        # Arbitrary shape, but default initialization of attributes
+        # Current collection, original image size, current channel count
         ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype)\
                 .view(RoadImage)
         ret._inherit_attributes(self)   # Copy most attributes not affected by warping 
@@ -1794,7 +1828,7 @@ class RoadImage(np.ndarray):
                 cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
             ret.warped = True
 
-        return ret
+        return ret , origin
 
     @strict_accepts(object, tuple)
     @generic_search(unlocked=True)
@@ -2051,6 +2085,247 @@ class RoadImage(np.ndarray):
         """
         pass
 
+    def _retrieve_cal(self):
+        """
+        Retrieve cal associated with nearest of wrap, undistort, in the ancestry of
+        the image.
+        """
+        wrap_undist_ops=None
+        for p in self.parents():
+            if p.parent is None:
+                warp_undist_ops = RoadImage.select_ops(self.find_op(parent=p, raw=False, quiet=False),
+                                                       ['warp', 'undistort'])
+                break
+
+        if warp_undist_ops: nearest = warp_undist_ops[-1]
+        else: return None
+        # Two possibilities depending on whether op was called like this: op(cal), or like this: op(cal=cal).
+        arg1 = nearest[1]  # tuple of args
+        calis=[]
+        calobj=[]
+        for arg in nearest[1:]:
+            if arg[0] == dict:
+                for a in arg[1:]:
+                    if issubclass(type(a[1]),CameraCalibration):
+                        if a[0]=='cal':      calis.append(a[1])
+                        else:                calobj.append(a[1])
+            else:
+                for a in arg:
+                    if issubclass(type(a), CameraCalibration):  calobj.append(a)
+        if calis: return calis[0]
+        if calobj: return calobj[0]
+        return None
+    
+    @strict_accepts(object, tuple, str, (tuple,None))
+    @generic_search()
+    @flatten_collection
+    def curves(self, key, *, dir='x', width=0.12, origin, scale, wfunc=None, minpts=150, sfunc=None, cal=None, **kwargs):
+        """
+        Extract curves from self.
+        key is a tuple. The result will be a geometry referenced by key.
+
+        If dir='y', key may fetch a function giving y as a function of x, and broadly horizontal lines
+        will be researched. Conversely if dir='x', key may fetch a function giving x as a function of 'y',
+        and curves will look for broadly vertical lines (i.e. lane lines on a warped image).
+        if there is no apriori knowledge of the lines ('one',) can be used to search on the right of the
+        car, and Line.blend(key1=('zero',),key2=('one',),w1=1,w2=-1) to search on the left at roughly
+        1 meter from the car centerline.
+
+        width indicates the width of the lines we are looking for in meters.
+        origin is the location of the camera in x,y (in pixels and usually off the bottom of self).
+        scale is (sx,sy) the scale of the warped self in meters/pixel.
+        wfunc is a weight function, which will be used to reduce the importance of points situated
+        minpts is the number of points curves will try to pass to np.polyfit.
+        sfunc is a scoring function which will be passed the key and the x and y of each contributing
+        partial solution, and which should return a score between 0 and 1. It can be used to assess how
+        far the current solution is from an ideal line start from the previous frame for instance.
+
+        cal is the camera calibration instance which was used to warp self. It will be retrieved from
+        self's history in most cases, but you may need to pass it if self is a synthetic test image for instance.
+        cal will only be used if curves cannot find the instance used for warping, and a warning will be printed.
+
+        curves paints itself on self using predefined Line attributes.
+        """
+        # TODO: weight based on euclidian distance between key and solution...
+        
+        # When a curve of a given width is extracted from a warped image, there is an interval that
+        # (dX/dY) must stay in for a given X,Y,Z location from the camera, or else the line becomes invisible.
+        # The ideal is lines which radiate from the camera and appear vertical in perspective.
+        def deriv_bounds(cal, X,Y,Z, width):
+            """
+            For a Line geometry given in camera axes (X=0,Y=0,Z>0 is the optical axis), this function
+            gives the acceptable bounds of the derivative of that Line wrt Z, dX/dZ(X,Y,Z), which make
+            the detection by the camera of that object plausible.
+            If the test is failed on distant parts of the Line geometry, it means that the description is
+            invalid at that distance (may have detected a bigger object, or maybe it's an extrapolation).
+            """
+            # Plausible slope variation from ideal slope, function of height above road Y, distance Z
+            # camera resolution given by focal_length() and width of painted line.
+            if Y is None: Y = cal.camera_height
+            dxdz = np.tan(np.arcsin(np.minimum(np.ones_like(Z),cal.focal_length('y')*abs(Y)*width/ Z**2)))
+            # ideal slope
+            ideal = X/Z
+            return (ideal-dxdz, ideal+dxdz)
+
+        my_cal = self._retrieve_cal()
+        if cal is None:
+            if my_cal is None:
+                raise ValueError('RoadImage.curves: No CameraCalibration associated with this image. Pass arg cal.')
+            else:
+                cal = my_cal
+        elif my_cal is None:
+            warnings.warn('RoadImage.curves: No CameraCalibration associated with this image. Using arg cal.') 
+            
+        cnt, h, w, ch = self.shape
+
+        # The grid is a stipple pattern made of two slices. The x and y arrays of nonzero pixels are
+        # concatenated before passing them to polyfit.
+        sx,sy = scale
+        stepx = max(int(width/2/sx),2)
+        stepy = max(int(width/2/sy),2)
+        startx = stepx//2
+        starty = stepy//2
+        iterx  = stepx - startx
+        itery  = stepy - starty
+        
+        # test if wfunc uses pixel values wfunc(x,y,val)
+        wrap_w=False
+        if wfunc:
+            try:
+                w = float(wfunc(0,0,1.))
+                wrap_w=True
+            except (TypeError,ValueError):
+                # Problem with number of arguments or type of returned value
+                pass
+            try:
+                w = float(wfunc(0,0))
+            except (TypeError,ValueError) as e:
+                raise TypeError('RoadImage.curves: arg wfunc must accept 2 or 3 numpy arrays/scalars of the same length.')
+        
+        # origin and accumulator
+        x0,y0 = origin
+        resultkey = ('result',current_thread())
+        acckey = ('acc',current_thread())  # thread safe key for storage in shared self.lines
+        self.lines.copy(self.lines.zero(),acckey)  # use thread local key in shared lines dictionary
+        acc_w = 0
+
+        # Small variant of iterator ensures that the inner loop is on Y after the eventual swap of X and Y.
+        if dir=='x':
+            iters = ( (i,j) for j in range(itery) for i in range(iterx) )
+        elif dir=='y':
+            iters = ( (i,j) for i in range(iterx) for j in range(itery) )
+        else:
+            raise ValueError("RoadImage.curve: argument dir must be either 'x' or 'y'.")
+        
+        # subgrids
+        for i,j in iters:
+            sub = self.view(np.ndarray)[0,j::stepy,i::stepx]
+            y1,x1,_ = np.nonzero(sub)  # pixels appear once for each channel they are =1 in (weight by channels)
+            if wrap_w:
+                val1 = sub[y1,x1]  # May be RGB pixels or not, but always vectors of length 1 or more
+            sub = self.view(np.ndarray)[0,j+starty::stepy,i+startx::stepx]
+            y2,x2,_ = np.nonzero(sub)
+            if wrap_w:
+                val2 = sub[y2,x2]
+            # Wrap values with weight function
+            if wrap_w:    weight_func = partial(wfunc, val=np.concatenate([val1,val2],axis=0))
+            else:         weight_func = wfunc
+                
+            # Compute physical coordinates
+            X1 = (x1*stepx+i-x0)*sx
+            Y1 = (y0-y1*stepy-j)*sy
+            X2 = (x2*stepx+i+startx-x0)*sx
+            Y2 = (y0-y2*stepy-j-starty)*sy
+            # Concatenate
+            X = np.concatenate([X1,X2], axis=0)
+            Y = np.concatenate([Y1,Y2], axis=0)
+            # Pass everything to self.lines.fit(), which does y data conditioning using key,
+            # solves, and records the geometry in its private format in self.lines.
+            if dir=='x':  # verticals X=f(Y)
+                X,Y = Y,X
+            try:
+                self.lines.copy(key,resultkey)
+            except KeyError:
+                self.lines.copy(self.lines.zero(),resultkey)
+                key = ('zero',)
+                
+            self.lines.fit(resultkey, X, Y, wfunc=weight_func, **kwargs)
+
+            # Rate solution (refY cannot be done out of the loop because X changes)
+            refY = self.lines.eval(key, z=X)
+            newY = self.lines.eval(resultkey, z=X)
+            ## weight function
+            if wrap_w:
+                # iF weight function uses pixel values, we must go back to image and fetch those values
+                if dir=='x': # x=f(Y)
+                    y = int(round(y0 - X/sy))
+                    refx = int(round(refY/sx + x0))
+                    newx = int(round(newY/sx + x0))
+                    refval = self[y, refx]
+                    newval = self[y, newx]
+                else:       # y=f(X)
+                    x = int(round(X/sx + x0))
+                    refy = int(round(y0 - refY/sy))
+                    newy = int(round(y0 - newY/sy))
+                    refval = self[refy, x]
+                    newval = self[rewy, x]
+                refw = sum(wfunc(X, refY, refval))
+                neww = sum(wfunc(X, newY, newval))
+            elif wfunc:
+                refw = sum(wfunc(X, refY))
+                neww = sum(wfunc(X, newY))
+            else:
+                refw = 1.
+                neww = 1.
+                
+            weight_score = neww/refw
+
+            ## deriv_bounds test
+            # The score is the proportion of the curve which complies with the constraint, stopping
+            deriv = self.lines.eval( resultkey, z=X, der=1 )
+            # sort points : near to far, away from 0, and calculate derivative bounds
+            if dir=='x':
+                index = np.argsort(abs(Y)+1000*X)
+                derbounds = deriv_bounds(cal, Y, None, X, width)
+            else:
+                index = np.argsort(abs(X)+1000*Y)
+                derbounds = deriv_bounds(cal, X, None, Y, width)
+                # By construction, horizontal curves cannot pass this test with null derivative
+                # even if at that location deriv_bounds allows nearly +/-90° angle. Nudge slightly.
+                deriv[(abs(deriv)<=np.finfo(np.float32).eps)]=np.finfo(np.float32).eps
+                deriv = 1./deriv
+            lbounds = ((deriv >= derbounds[0]) & (deriv <= derbounds[1]))
+            if np.all(lbounds): bounds_score = 1.
+            else:               bounds_score = (1+np.argmin(lbounds[index]))/len(lbounds)
+
+            ## custom scoring function
+            cust_score = 1  # No influence, default
+            if sfunc:
+                try:
+                    cust_score = sfunc(self.lines,key,resultkey,dir,X,newY)
+                    if cust_score < 0.1 : cust_score=0.1  # do not formally eliminate solutions
+                    elif cust_score > 1 : cust_score=1    # cap influence
+                except:
+                    pass
+            
+            # Debug
+            print('DEBUG: p(%d,%d)='% (i,j), self.lines.stats(resultkey,'poly'))
+            print('scores: cust=%0.2f  weight=%0.2f  derbounds=%0.2f' % (cust_score, weight_score, bounds_score))
+            # Accumulate solution
+            weight = cust_score * weight_score * bounds_score
+            acc_w += weight
+            self.lines.blend(acckey,key1=acckey,key2=resultkey,
+                             op='wsum', w1=1, w2=weight)
+            # Draw solution...
+            
+        # Loop on subgrids finished - normalize result and save under arg key.
+        self.lines.blend(key, key1=self.lines.zero(), key2=acckey,
+                         op='wsum', w1=0, w2=1/acc_w)
+        # cleanup: erase 'result', 'acc', 
+        self.lines.delete(resultkey)
+        self.lines.delete(acckey)
+        return
+        
     # The next section contains specialized operators for autonomous road vehicles
     # - extract_lines does image processing to robustly identify pixels belonging to
     #   lane lines on the picture.
@@ -2209,15 +2484,28 @@ class RoadImage(np.ndarray):
         
     @generic_search()
     @flatten_collection
-    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), method):
+    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), method, save=False):
         """
         Gets a warped version of self, and looking at the bottom quarter of that image
         Locate the start of the left and right lane lines. 
         The result is a small image or image collection, in which pixel[0,0] is the 
         x pixel coordinate of the left lane line, and pixel[0,1] is the x pixel coordinate
         of the right lane line.
+        If save is true, parameters which can help find lines on the next frame are saved.
         """
         # TODO: compute mask from curvrange and cal or from existing (past) Lines
+        # Curvature is stored, and curvature filter status too.
+        from scipy import signal
+        curv_b, curv_a = signal.butter(4, 1/6)
+        
+        rec = self.find_lines_data
+        try:
+            curv_zi = rec.curv_zi
+            curvature = rec.curvature
+            # Adaptive curvrange (all using functions saturate it in the same fashion)
+            curvrange = tuple(curvature + c for c in curvrange)
+        except AttributeError:
+            curv_zi = signal.lfilter_zi(curv_b, curv_a)* 0.5*(curvrange[0]+curvrange[1])
         
         # Will not be computed if it exists already
         filter = self.extract_lines(cal, lrmask=None, mask=None)
@@ -2248,28 +2536,101 @@ class RoadImage(np.ndarray):
         lsearch = range(max(0, int(img_cx - 3.6 / sx)), max(window_width, int(img_cx - 0.5 / sx)))
         rsearch = range(min(width-window_width, int(img_cx + 0.5 / sx)), min(width, int(img_cx + 3.6 / sx)))
 
-        lane_width = None # Implies that l_center and r_center are undefined.
+        try:
+            lane_width = rec.lane_width
+            l_center = rec.l_center
+            r_center = rec.r_center
+        except AttributeError:
+            lane_width = None         # Implies that l_center and r_center are undefined too.
+        try:
+            motion = rec.motion
+        except AttributeError:
+            motion = np.zeros(2)
+            
         green = np.array([ 0., 0.9, 0.6, 0.6 ])
         red = np.array([ 1., 0.1, 0., 0.5 ])
+
+        peaksz = self.lines.width / sx
+        peaksz = np.arange(peaksz/2,2*peaksz)
         
+        def find_start(bimg):
+            #from scipy import signal
+            
+            # Uses signal, peaksz from external environment
+            #sum = np.sum(bimg, axis=0)
+            #peakind = signal.find_peaks_cwt(sum, peaksz)  # returns an array
+            #assert len(peakind)==1, 'RoadImage.find_lines.find_start:BUG: More than one peak found! %s' % repr(peakind)
+            #print('DEBUG:find_start peaks:',peakind)
+            # Refine location
+            h,_ = bimg.shape
+            subgrid = 4
+            p = np.zeros(2, dtype=np.float64)
+            for i in range(subgrid):
+                for j in range(subgrid):
+                    y,x = np.nonzero(bimg[i::subgrid, j::subgrid])
+                    y = (y*subgrid + i)
+                    x = (x*subgrid + j)
+                    q = np.polyfit(y,x,1)
+                    #print('DEBUG: q(%d,%d)=%s'% (i,j,str(q)))
+                    p += q
+            p /= subgrid*subgrid
+            return int(p[1]+h*p[0])
+                             
         for ix, img in enumerate(warped):
 
             if lane_width is None:
-                # Sum quarter bottom of image to get slice, could use a different ratio
-                l_sum = np.sum(img[int(3*img.shape[0]/4):,lsearch], axis=(0,2))
-                l_center = np.argmax(np.convolve(window,l_sum))-window_width/2+lsearch.start
-                r_sum = np.sum(img[int(3*img.shape[0]/4):,rsearch], axis=(0,2))
-                r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+rsearch.start
-
+                l_center = find_start(img[int(.5*img.shape[0]):, lsearch, 0])+lsearch.start
+                r_center = find_start(img[int(.5*img.shape[0]):, rsearch, 0])+rsearch.start
+                print('DEBUG/Line positions: left =',l_center,' right =',r_center)
+            
             lane_width = int(r_center - l_center)
-            #print('DEBUG/Line positions: left =',l_center,' right =',r_center)
 
             raw[ix].channel(1)[:] = method(img, x=l_center, lanew=lane_width, scale=scale)
             raw[ix].channel(0)[:] = method(img, x=r_center, lanew=lane_width, scale=scale)
             
             # Extract line geometry: returns line "density" (i.e dashes or solid) and maximum z achieved for fitting
-            ldens, lz = self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
-            rdens, rz = self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)), origin=o, scale=scale)
+            tmotion = tuple(motion.tolist())
+            try:
+                lmotion = np.zeros(2)
+                ldens, lz = self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
+                try:
+                    lmotion = np.array(self.lines.delta( ('last','left',ix), ('current','left',ix) ))
+                except KeyError:
+                    pass
+            except RuntimeError:
+                self.lines.move( ('last','left',ix), origin=tmotion, dir=0, key2=('current','left',ix)  )
+                ldens, lz = self.lines.stats( ('current','left',ix), 'dens', 'zmax' )
+            try:
+                rmotion = np.zeros(2)
+                rdens, rz = self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)),
+                                                origin=o, scale=scale)
+                try:
+                    rmotion = np.array(self.lines.delta( ('last','right',ix), ('current','right',ix) ))
+                except KeyError:
+                    pass
+            except RuntimeError:
+                self.lines.move( ('last','right',ix), origin=tmotion, dir=0, key2=('current','right',ix)  )
+                rdens, rz = self.lines.stats( ('current','right',ix), 'dens', 'zmax' )
+
+            # Evaluate lane width ahead
+            #self.lines.blend( ('current','lanew',ix), key1=('current','right',ix), key2=('current','left',ix),
+            #                  w1 = 1, w2 = -1)
+            #lw = self.lines.eval( ('current','lanew',ix), z=np.arange(5,z,10) )
+            
+
+            # vote motion, lmotion, rmotion
+            # Exclude the most distant in Y 
+            if abs(lmotion[1] - motion[1]) > abs(rmotion[1] - motion[1]):
+                nmotion = rmotion
+            else:
+                nmotion = lmotion
+            motion = 0.1*nmotion + 0.9*motion # dampen a lot.
+            if save:
+                self.find_lines_data.motion = motion
+                try:
+                    self.find_lines_data.motion_history.append(motion)
+                except AttributeError:
+                    self.find_lines_data.motion_history = [motion]
 
             # Use undistorted, warped input image as background for results (uncomment to use)
             # Option 1: use warped image as background
@@ -2277,17 +2638,27 @@ class RoadImage(np.ndarray):
             # Option 2: use a black background to observe only the graphics
             #backgnd = np.zeros(shape=img.shape[:2]+(self.shape[-1],), dtype=np.float32).view(RoadImage)
             #backgnd._inherit_attributes(img)    # Shape of warped img, but nb_channels and dtype of camera image (self).
-
+            # Standard is to return unwarped graphics overlaid on image. Leave everything commented out.
+            
             # Blend left and right to get median line
             self.lines.blend( ('current','lane',ix), key1=('current','left',ix), key2=('current','right',ix),
                               op='wavg', w2=0.5 )
             # Measure curvature
             curvature = self.lines.curvature( ('current','lane',ix) , z=z_sol)
-            
+            curvature, curv_zi = signal.lfilter(curv_b, curv_a, [curvature], zi=curv_zi)
+            curvature = curvature[0]
+            if save:
+                self.find_lines_data.curvature = curvature
+                self.find_lines_data.curv_zi = curv_zi
+                
             # Measure lane width
             l_center = self.lines.eval( ('current','left',ix), z=z_sol )  
             r_center = self.lines.eval( ('current','right',ix), z=z_sol ) 
             lane_width = r_center - l_center
+            if save:
+                self.find_lines_data.lane_width = lane_width
+                self.find_lines_data.r_center = r_center
+                self.find_lines_data.l_center = l_center
 
             backgnd = ret[ix]  # Comment this out to draw on warped images (select background above)
             cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
@@ -2309,7 +2680,7 @@ class RoadImage(np.ndarray):
             r_center = round(img_cx + r_center / sx)
             
             # Draw on background image
-            z_max = (min(lz,rz)-20) / (z-20)      # ratio of achieved z to desired z (full red at 20 m)
+            z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
             if z_max < 0: z_max=0
             color = green * z_max + red * (1-z_max)
             def _warp(img):
@@ -2318,8 +2689,9 @@ class RoadImage(np.ndarray):
             def _unwarp(img):
                 return img.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
             
-            self.lines.draw( ('current','lane',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
-                             width=lane_width, color=color)
+            self.lines.draw_area( ('current','left',ix), ('current','right',ix), backgnd,
+                                  origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
+                                  width=lane_width, color=color)
             self.lines.draw( ('current','left',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
             self.lines.draw(('current','right',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
 
@@ -2365,6 +2737,8 @@ class RoadImage(np.ndarray):
 
         # Trace first centroid
         window_mask(x, 0)
+        delta = 0
+        deltax = 0
         
         for level in range(1,nb_layer):
             # convolve the window into the vertical slice of the image
@@ -2377,7 +2751,14 @@ class RoadImage(np.ndarray):
             offset = window_width/2
             min_index = int(max(x+offset-margin,0))
             max_index = int(min(x+offset+margin,self.shape[1]))
-            x = np.argmax(conv_signal[min_index:max_index])+min_index-offset
+            if len(conv_signal[min_index:max_index])==0: newx = 0
+            else: newx = np.argmax(conv_signal[min_index:max_index])
+            if newx == 0:
+                x=x+deltax  # No detection, argmax returns 0, the value is invalid
+            else:
+                newx += min_index-offset
+                deltax = 0.5*(delta + newx - x) # sliding average for delta
+                x = newx
             # Draw what we found for that layer
             window_mask(x, level)
 

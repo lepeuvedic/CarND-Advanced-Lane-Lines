@@ -1,6 +1,8 @@
 import numpy as np
 import cv2
 from abc import ABC, abstractmethod
+from threading import current_thread
+import copy
 
 # Module variables
 _subclasses = {}
@@ -17,6 +19,7 @@ class Line(ABC):
     A new geometry can be blended with an old geometry updated via axes'motion.
     The axes are typically the location and orientation of the car's camera.
     """
+    
     # Static variables
     # In each derived class, this class variable is initialised to that class.
     _default_sub = None
@@ -89,16 +92,89 @@ class Line(ABC):
         self._geom = {}
         return None
 
-    def move(self, key, *, origin, dir):
+    def zero(self):
+        """
+        Returns the key under which the representation of y=0 is stored.
+        Usually 'zero', but will be build if required.
+        """
+        KEY0=('zero',)
+        if not(KEY0 in self._geom):
+            self.blend(KEY0,key1=('one',),key2=('one',),op='wsum',w1=1,w2=-1)
+        return KEY0
+
+    def one(self):
+        """
+        Returns the key under which the representation of y=1 is stored.
+        Derived classes shall define y=1 in their __init__ method, and store it under that key.
+        """
+        return ('one',)
+    
+    def move(self, key, *, origin, dir, key2=None):
         """
         origin is a tuple, a vector (x,y) from the current axes'origin and the new origin.
         The vector should be estimated based on car speed and direction.
         dir is a unit length vector giving the new "ahead" direction.
-        The geometry associated to key is represented in the new axes.
+        The geometry associated to key is represented in the new axes and
+        associated with key2 if supplied.
         """
         # The default implementation assumes that for small changes of origin and direction
         # we can just do nothing.
+        if key2: self._geom[key2] = self._geom[key]
+
+    def delete(self, key):
+        """
+        Delete reference to a geometry. A geometry may be referenced multiple times.
+        It will disappear when it is no longer referenced.
+        """
+        del self._geom[key]
+
+    def copy(self, key1, key2):
+        """
+        Make a deep copy of geometry information under name key2.
+        See documentation of module copy to provide deepcopy semantics to user classes.
+        """
+        g1 = self._geom[key1]
+        self._geom[key2] = copy.deepcopy(g1)
+        
+    @abstractmethod
+    def delta(self, key1, key2):
+        """
+        Assumes that key1 and key2 describe the same geometry with an offset in the origin.
+        Returns an estimate of that offset which can be given to 'move' as argument origin.
+        """
         pass
+
+    def fit(self, key, x, y, func=None, **kwargs):
+        """
+        Fit a geometry controlled by additional arguments **kwargs to the points
+        given by coordinate arrays x and y. Stores result under 'key'.
+        """
+        if func is None:
+            # The method does not know how to perform the generic data fit. See LinePoly.fit.
+            raise ValueError('Line.fit: This method must be called with super() from derived classes.')
+
+        if not(key in self._geom):
+            # This parent method is useless when there is no pre-existing geometry
+            raise ValueError('Line.fit: This method must be called with super() only when key exists.')
+
+        safekey = ('Line.fit',current_thread())
+
+        # does 'blend' support op 'wsum' and is key an existing geometry?
+        try:
+            self.blend(safekey, key1=key, key2=key, op='wsum', w1=1, w2=0)
+            # It worked: 'wsum' exists and we just backed up key to safekey.
+            # normalize y in order to better condition matrix
+            y = y - self.eval(safekey, z=x)
+        except NotImplementedError:
+            self.delete(key)  # Can safely call func now, without infinite recursion
+            func(key, x, y, **kwargs)
+            return
+
+        self.delete(key)
+        func(key, x, y, **kwargs)
+        self.blend(key, key1=safekey, key2=key, op='wsum', w1=1, w2=1)
+        self.delete(safekey)
+        return
 
     @abstractmethod
     def estimate(self, key, image, *, origin, scale, **kwargs):
@@ -143,7 +219,21 @@ class Line(ABC):
         The radius of curvature is the inverse of the curvature.
         """
         return self.eval(key, z=z, der=2)/abs(1+self.eval(key, z=z, der=1)**2)**1.5
-    
+
+    def stats(self, key, *args):
+        """
+        Returns a tuple. A KeyError exception is thrown if some requested variables are not found. Any value
+        can be passed: lines.stats( key, dens=0, zmax=0 ) --> dens , zmax
+        """
+        def value_or_None(d,k):
+            try:
+                return d[k]
+            except KeyError:
+                return None
+            
+        l = self._geom[key]
+        return tuple([ value_or_None(l,k) for k in args])
+            
     @property
     def color(self):
         """
@@ -240,9 +330,9 @@ class Line(ABC):
                 self._blink_counter = 0
                 
         # Enable blinking line if there are dashes
-        if density > 0.6: self.blink = 9
-        elif not(self._blink_state):
-            return
+        # Callers can test blinking.
+        if density < 0.6:
+            self.blink = 9
         
         # Create buffer
         # Make a fresh road image buffer from image
@@ -278,6 +368,89 @@ class Line(ABC):
         thick = int(2**shift * width / sx / 2.)
         points_up = [ [int(2**shift * xi - thick), int(2**shift * yi)] for xi,yi in zip(x,y) ]
         points_dn = [ [int(2**shift * xi + thick), int(2**shift * yi)] for xi,yi in zip(x,y) ]
+        points_dn.reverse()
+        pts = np.array(points_up + points_dn, dtype=np.int32)
+
+        cv2.fillConvexPoly(buffer, pts, color=list(color), shift=shift, lineType=cv2.LINE_AA)
+        if nb_ch == 4:
+            # image, buffer have depth 4
+            # Alpha blend buffer
+            # buffer contains RGBA data, with per pixel alpha
+            alpha = buffer.channel(3).to_float()
+        else:
+            # Assume alpha is self._color[3] where buffer has _color
+            alpha = np.amax(buffer.to_float(), axis=2, keepdims=True)
+            if len(self.color)>=4:   alphaval = self.color[3]/255.
+            else:                    alphaval = 1.0
+            alpha[(alpha>0.0)] = alphaval
+
+        if not(image.warped):
+            buffer = unwarp(buffer)
+            alpha = unwarp(alpha)
+            
+        image *= (1-alpha)
+        image += (alpha*buffer)
+        return None
+
+    def draw_area(self, key1, key2, image, *, origin, scale, color=None, width=None, warp=None, unwarp=None):
+        """
+        Draws a smooth graphical representation of the lane line in an image, taking into 
+        account origin and scale.
+        If image is not warped, the line is drawn in a warped buffer, then unwarped and alpha
+        blended into the image.
+        Returns None: the line is drawn in image.
+        """
+        height, _, nb_ch = image.shape
+        sx,sy = scale
+        try:
+            # retrieve 'zmax'
+            z_max = min(self._geom[key1]['zmax'],self._geom[key2]['zmax'])
+        except KeyError:
+            z_max = sy * height
+
+        # Blink processing
+        if self._blink_counter < self._blink:
+            self._blink_counter += 1
+            if self._blink_counter == self._blink:
+                self._blink_state = not(self._blink_state)
+                self._blink_counter = 0
+                
+        # Create buffer
+        # Make a fresh road image buffer from image
+        buffer = np.zeros_like(image, subok=True)
+        if not(image.warped):
+            if warp is None or unwarp is None:
+                raise ValueError('Line.draw_area: warp and unwarp function handles '+
+                                 'must be provided to work on unwarped image.')
+            # Create a warped buffer
+            buffer = warp(buffer)
+
+        # Color processing
+        if color is None: color = self.color
+        else:             color = Line._normalize_color(color)
+        color = color[:nb_ch]/255.
+        
+        # Call eval with key to get lane line skeleton in world coordinates
+        x0,y0 = origin     # (out of image) pixel coordinates of camera location
+
+        rng = range(0, int(z_max/sy), int(2./sy))  # one segment every 2 meters
+        z = sy * np.array([(y0-height)+y for y in rng], dtype=np.float32)
+        x1 = self.eval(key1,z=z)
+        x2 = self.eval(key2,z=z)
+        
+        # Compute pixel coordinates using sx,sy and origin
+        x1 = x0 + x1/sx
+        x2 = x0 + x2/sx
+        y = y0 - z/sy
+            
+        # Plot as polygon
+        # fillConvexPoly is able to handle any poly which crosses at most 2 times each scan line
+        # and does not self-intersect. Ours is a function and fits the definiion.
+        # We work with antialiasing and 3 bits of subpixels: every coordinate is multplied by 8
+        shift=3
+        #thick = int(2**shift * width / sx / 2.)
+        points_up = [ [int(2**shift * xi), int(2**shift * yi)] for xi,yi in zip(x1,y) ]
+        points_dn = [ [int(2**shift * xi), int(2**shift * yi)] for xi,yi in zip(x2,y) ]
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 

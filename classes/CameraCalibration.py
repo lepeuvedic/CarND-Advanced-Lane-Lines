@@ -215,7 +215,12 @@ class CameraCalibration(object):
             return ahead_x+centerx, ahead_y+centery
         return ahead_x+centerx, aheady
 
-    def set_camera_height(self, h):
+    @property
+    def camera_height(self):
+        return self.camheight
+
+    @camera_height.setter
+    def camera_height(self,h):
         """
         Define the height of the camera above the ground, in real units (meters).
         """
