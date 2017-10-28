@@ -1757,9 +1757,9 @@ class RoadImage(np.ndarray):
 
         return dsize, -img_width[0]
 
-    def unwarp(self, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001)):
-        cal = self._retrieve_cal()
-        return self.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange, _unwarp=True)
+    def unwarp(self, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), cal=None):
+        cal = self._retrieve_cal(cal)
+        return self.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange, _unwarp=True)[0]
 
     @generic_search()
     @flatten_collection
@@ -1806,7 +1806,13 @@ class RoadImage(np.ndarray):
         trap = np.array(trapeze, dtype=np.float32) - np.array(offsets, dtype=np.float32)
         
         persp_mat = cv2.getPerspectiveTransform(trap, rect)
-
+        
+        # TODO: apply perspective transform to the bounding box of img (0,0),(w,0),(w,h),(0,h)
+        #       compute bounding box of result, compute crop of this bounding box wrt dsize,
+        #       offset trapeze coordinates (pixels) and return a smaller picture with crop_area set.
+        #       May impact crop_area calculations since the parent is the warped image.
+        #       May need to truncate image since crop_area extending beyond parent boundary is prohibited.
+        
         # Storage for results
         if _unwarp:
             if self.get_size() != dsize:
@@ -2085,12 +2091,12 @@ class RoadImage(np.ndarray):
         """
         pass
 
-    def _retrieve_cal(self):
+    def _retrieve_cal(self, cal=None):
         """
         Retrieve cal associated with nearest of wrap, undistort, in the ancestry of
         the image.
         """
-        wrap_undist_ops=None
+        warp_undist_ops=None
         for p in self.parents():
             if p.parent is None:
                 warp_undist_ops = RoadImage.select_ops(self.find_op(parent=p, raw=False, quiet=False),
@@ -2098,9 +2104,8 @@ class RoadImage(np.ndarray):
                 break
 
         if warp_undist_ops: nearest = warp_undist_ops[-1]
-        else: return None
+        else: return cal
         # Two possibilities depending on whether op was called like this: op(cal), or like this: op(cal=cal).
-        arg1 = nearest[1]  # tuple of args
         calis=[]
         calobj=[]
         for arg in nearest[1:]:
@@ -2112,9 +2117,18 @@ class RoadImage(np.ndarray):
             else:
                 for a in arg:
                     if issubclass(type(a), CameraCalibration):  calobj.append(a)
-        if calis: return calis[0]
-        if calobj: return calobj[0]
-        return None
+        if calis:    my_cal = calis[0]
+        elif calobj: my_cal = calobj[0]
+        else:        my_cal = None
+        if cal is None:
+            if my_cal is None:
+                raise ValueError('RoadImage._retrieve_cal: No CameraCalibration associated with this image. Pass arg cal.')
+            else:
+                return my_cal
+        elif my_cal is None:
+             warnings.warn('RoadImage._retrieve_cal: No CameraCalibration associated with this image. Using arg cal.') 
+           
+        return cal
     
     @strict_accepts(object, tuple, str, (tuple,None))
     @generic_search()
@@ -2167,15 +2181,16 @@ class RoadImage(np.ndarray):
             ideal = X/Z
             return (ideal-dxdz, ideal+dxdz)
 
-        my_cal = self._retrieve_cal()
-        if cal is None:
-            if my_cal is None:
-                raise ValueError('RoadImage.curves: No CameraCalibration associated with this image. Pass arg cal.')
-            else:
-                cal = my_cal
-        elif my_cal is None:
-            warnings.warn('RoadImage.curves: No CameraCalibration associated with this image. Using arg cal.') 
-            
+        # my_cal = self._retrieve_cal()
+        # if cal is None:
+        #     if my_cal is None:
+        #         raise ValueError('RoadImage.curves: No CameraCalibration associated with this image. Pass arg cal.')
+        #     else:
+        #         cal = my_cal
+        # elif my_cal is None:
+        #     warnings.warn('RoadImage.curves: No CameraCalibration associated with this image. Using arg cal.') 
+        cal = self._retrieve_cal(cal)
+        
         cnt, h, w, ch = self.shape
 
         # The grid is a stipple pattern made of two slices. The x and y arrays of nonzero pixels are
@@ -2509,7 +2524,7 @@ class RoadImage(np.ndarray):
         
         # Will not be computed if it exists already
         filter = self.extract_lines(cal, lrmask=None, mask=None)
-        warped = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+        warped, _ = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
 
         # warp_size returns the size of warped ( warped.get_size() )
         # and the x position of the camera. They are optimized as a function of curvrange.
@@ -2683,11 +2698,11 @@ class RoadImage(np.ndarray):
             z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
             if z_max < 0: z_max=0
             color = green * z_max + red * (1-z_max)
-            def _warp(img):
-                return img.warp(  cal, z=z, h=h, scale=scale, curvrange=curvrange)
+            
+            _warp = lambda img: img.warp(  cal, z=z, h=h, scale=scale, curvrange=curvrange)[0]
             
             def _unwarp(img):
-                return img.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
+                return img.unwarp(z=z, h=h, scale=scale, curvrange=curvrange, cal=cal)
             
             self.lines.draw_area( ('current','left',ix), ('current','right',ix), backgnd,
                                   origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
