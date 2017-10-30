@@ -3,7 +3,7 @@ from .Line import Line
 
 class LinePoly(Line):
 
-    def __init__(self, order=3):
+    def __init__(self, order=4):
         # Add an attribute for polynomial order
         super().__init__()
         self._default_order = order
@@ -35,7 +35,7 @@ class LinePoly(Line):
         
         # Fit (returns the polynomial coefficients and the covariance matrix)
         self._geom[key] = { 'op':'fit' } 
-        if len(x)>order+2:
+        if len(x)>order+10:
             p, V = np.polyfit(x, y, order, w=w, cov=True)
             # Store result
             self._geom[key]['cov'] = V
@@ -212,8 +212,8 @@ class LinePoly(Line):
         """
         # For polynoms X = P(Y), the X offset is P2[0]-P1[0] and the Y offset is the other formula.
         # May not be robust, except on geometries made by 'move'.
-        # Is wrong unless order is 3 or 2 less. It is impossible to distinguish X motion from Y motion
-        # on order 1 (straight lines), unless one happens to know the expected distance.
+        # It is impossible to distinguish X motion from Y motion on order 1 (straight lines),
+        # unless one happens to know the expected distance.
         def coef(P,i,j):
             from math import factorial as fact
             if i>=len(P) or j>i: return 0
@@ -231,7 +231,7 @@ class LinePoly(Line):
         else:                exchange=False
             
         if len(p1)>1:
-            p2 = P2[:len(p1)]    # Cut P2 at same length, because they must be the same order if P2=P1.move(X,Y)
+            p2 = p2[:len(p1)]    # Cut P2 at same length, because they must be the same order if P2=P1.move(X,Y)
             A = np.array([ [ coef(p1,i,j) for i,_ in enumerate(p1,j) ] for j,_ in enumerate(p1,0) ])
             powers = np.linalg.solve(A,p2)
 
@@ -246,12 +246,7 @@ class LinePoly(Line):
                 Y = powers
                 x = 0
             lny = np.log(abs(Y))
-            if len(lny)>3:
-                # the number of data points must exceed order + 2 for Bayesian estimate of V
-                l,V = np.polyfit(np.arange(len(lny)),lny,1,cov=True)
-                print('DEBUG: delta: covariance matrix=',V)
-            else:
-                l = np.polyfit(np.arange(len(lny)),lny,1,cov=False)
+            l = np.polyfit(np.arange(len(lny)),lny,1,cov=False)
             print('              zero offset=',l[1])
             y = float(np.exp(l[0]))
             if len(powers)>=3:

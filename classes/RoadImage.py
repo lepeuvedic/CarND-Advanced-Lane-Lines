@@ -1141,7 +1141,7 @@ class RoadImage(np.ndarray):
             # All the tests are needed because step can be negative to reverse the order of the channels
             if isview:
                 raise ValueError('RoadImage.channels: Default behavior is not compatible with '+
-                                 'the creation of new channels. Call with leftvalue=False.')
+                                 'the creation of new channels. Call with isview=False.')
             # Allocate new storage
             l = len([i for i in rng]) # Count channels to create
             if l==0:
@@ -1175,11 +1175,8 @@ class RoadImage(np.ndarray):
                 ret = self[:,:,:,n::step]
             else:
                 ret = self[:,:,:,n:m:step]  # Main operation. Using rng triggers a copy.
-            
-        ret.colorspace = self.colorspace
-        ret.gradient = self.gradient
-        ret.binary = self.binary
-        ret.warped = self.warped
+
+        ret._inherit_attributes(self)
         return ret
 
     def rgb(self,n=0):
@@ -2196,8 +2193,8 @@ class RoadImage(np.ndarray):
         # The grid is a stipple pattern made of two slices. The x and y arrays of nonzero pixels are
         # concatenated before passing them to polyfit.
         sx,sy = scale
-        stepx = max(int(width/2/sx),2)
-        stepy = max(int(width/2/sy),2)
+        stepx = max(int(width/sx),2)
+        stepy = max(int(width/sy),2)
         startx = stepx//2
         starty = stepy//2
         iterx  = stepx - startx
@@ -2221,14 +2218,14 @@ class RoadImage(np.ndarray):
         x0,y0 = origin
         resultkey = ('result',current_thread())
         acckey = ('acc',current_thread())  # thread safe key for storage in shared self.lines
-        self.lines.copy(self.lines.zero(),acckey)  # use thread local key in shared lines dictionary
+        self.lines.copy(self.lines.zero,acckey)  # use thread local key in shared lines dictionary
         acc_w = 0
 
         # Small variant of iterator ensures that the inner loop is on Y after the eventual swap of X and Y.
         if dir=='x':
-            iters = ( (i,j) for j in range(itery) for i in range(iterx) )
+            iters = ( (i,j) for j in range(itery) for i in range(stepx) )
         elif dir=='y':
-            iters = ( (i,j) for i in range(iterx) for j in range(itery) )
+            iters = ( (i,j) for i in range(iterx) for j in range(stepy) )
         else:
             raise ValueError("RoadImage.curve: argument dir must be either 'x' or 'y'.")
         
@@ -2261,8 +2258,8 @@ class RoadImage(np.ndarray):
             try:
                 self.lines.copy(key,resultkey)
             except KeyError:
-                self.lines.copy(self.lines.zero(),resultkey)
-                key = ('zero',)
+                key = self.lines.zero
+                self.lines.copy(key, resultkey)
                 
             self.lines.fit(resultkey, X, Y, wfunc=weight_func, **kwargs)
 
@@ -2284,11 +2281,11 @@ class RoadImage(np.ndarray):
                     newy = int(round(y0 - newY/sy))
                     refval = self[refy, x]
                     newval = self[rewy, x]
-                refw = sum(wfunc(X, refY, refval))
-                neww = sum(wfunc(X, newY, newval))
+                refw = sum(wfunc(X, np.zeros_like(X), refval))
+                neww = sum(wfunc(X, newY-refY, newval))
             elif wfunc:
-                refw = sum(wfunc(X, refY))
-                neww = sum(wfunc(X, newY))
+                refw = sum(wfunc(X, np.zeros_like(X)))
+                neww = sum(wfunc(X, newY-refY))
             else:
                 refw = 1.
                 neww = 1.
@@ -2324,8 +2321,9 @@ class RoadImage(np.ndarray):
                     pass
             
             # Debug
-            print('DEBUG: p(%d,%d)='% (i,j), self.lines.stats(resultkey,'poly'))
-            print('scores: cust=%0.2f  weight=%0.2f  derbounds=%0.2f' % (cust_score, weight_score, bounds_score))
+            #print('DEBUG: p(%d,%d)='% (i,j), self.lines.stats(resultkey,'poly'))
+            #print('DEBUG: p(%d,%d) scores: cust=%0.2f  weight=%0.2f  derbounds=%0.2f'
+            #      % (i,j,cust_score, weight_score, bounds_score))
             # Accumulate solution
             weight = cust_score * weight_score * bounds_score
             acc_w += weight
@@ -2334,9 +2332,8 @@ class RoadImage(np.ndarray):
             # Draw solution...
             
         # Loop on subgrids finished - normalize result and save under arg key.
-        self.lines.blend(key, key1=self.lines.zero(), key2=acckey,
+        self.lines.blend(key, key1=self.lines.zero, key2=acckey,
                          op='wsum', w1=0, w2=1/acc_w)
-        # cleanup: erase 'result', 'acc', 
         self.lines.delete(resultkey)
         self.lines.delete(acckey)
         return
@@ -2356,72 +2353,59 @@ class RoadImage(np.ndarray):
     @strict_accepts(object, CameraCalibration, tuple)
     @generic_search()
     @flatten_collection
-    @static_vars(mask=None, mask_file='training/straight_mask.png', lrmask=None,
-                 cspace='HLS', mini=[0.0627, 0.762, 0.75], maxi=[0.0863, 1.0,   1.0])
-    def extract_lines(self, cal=None, *, crop=None, lrmask=None, mask=None):
+    def extract_lines(self, *, lrmask, mask=None):
         """
         Does color thresholding and gradients analysis in multiple colorspaces, to robustly
         extract the pixels belonging to lane lines on an image.
-        If cal is supplied, the camera distortion will be removed first.
-        crop must be given in format ((x1,y1),(x2,y2)) (as a tuple)
-        lrmask can take various values:
-        - None: static mask left and right halves of the image
-        - None TODO: left and right halves based on camera center x coordinage (neglects the 
-          fact that the camera is not exactly pointed forward.
-        - 'auto': tries to determine the direction in which the camera points based on successive
-          images.
-        - 'last': uses the center of the lane from the previous image processed. Note that self
-          will always appear as a linear collection treated as a sequence of images. The last
-          mask is stored in lrmask static variable, and used for the first image at the next call.
-        - a binary mask or a sequence of binary masks
+        
+        lanekey is the key in self.lines of a curve representing the center of the lane.
+        mask is an optional mask. Pixels excluded by the mask will be blackened out.
         """
-        #TODO: argument: left/right mask is 1 on past known 'right' side of road
         # The lrmask is used to select pixels in operations when detect preferentially one
         # of the lines. x,y gradient ops do this, as well as [TODO] signed gradient orientation ops.
 
-        # Initialize mask
-        if mask is None:
-            if RoadImage.extract_lines.mask is None:
-                RoadImage.extract_lines.mask = RoadImage(filename=RoadImage.extract_lines.mask_file)\
-                                       .threshold(mini=0.5, inplace=True)
-                print('Loaded '+RoadImage.extract_lines.mask_file+'.')
-            mask = RoadImage.extract_lines.mask
+        class State(object):
+            pass
+        
+        state = getattr(self,'elstate',None)
+        if state is None:
+            state = State()
+            self.elstate = state
+            state.mask = None
+            state.lrmask = None
+            state.cspace = 'HLS'
+            state.mini = [0.0627, 0.762, 0.75]
+            state.maxi = [0.0863, 1.0,   1.0]
+            
+        if state.mask is None:
+            if mask is None:
+                state.mask = np.ones_like(self, dtype=uint8)
+                state.mask.binary=True
+            else:
+                # TODO: could allow TRAPEZE coordinates as well.
+                state.mask=mask
+        mask = state.mask
+
+        # Check mask
+        if mask.get_size()!=self.get_size() or not(mask.binary) or mask.shape[-1]!=1:
+            raise ValueError('RoadImage.extract_lines: mask must be binary, single channel, same size as self.')
+        
         # Outer product of per channel thresholds with per pixel mask.
         # The small offset on minimask ensure that it is larger than maximask on masked pixels
-        mini = np.tensordot(mask, [RoadImage.extract_lines.mini], axes=([2],[0]))+0.0001
-        maxi = np.tensordot(mask, [RoadImage.extract_lines.maxi], axes=([2],[0]))
+        mini = np.tensordot(mask, [state.mini], axes=([2],[0]))+0.0001
+        maxi = np.tensordot(mask, [state.maxi], axes=([2],[0]))
 
-        # TODO validate args
-        # (self has 3 or 4 channels - 4th will be ignored)
-        # (crop has correct format)
-        # (lrmask is a single binary image the same size as self, or a collection as long as self)
-        if lrmask is None:
-            if cal:
-                # left and right halves based on ahead vector (defaults to camera centre)
-                xc,yc = cal.get_ahead(0)  # straight ahead vector on camera
-                lrmask = np.ones_like(self[0].channel(0),subok=False)
-                lrmask[:,0:int(xc),:] = 0 
-            else:
-                # TODO: memorize lrmask and avoid doing the resize for each call.
-                #       but do it as a cache because lrmask is adaptative.
-                # lrmask could be a dict of lrmask solutions. lrmask has ones on RIGHT side
-                lrmask = cv2.resize(np.array([[0,1]]), self.get_size(),
-                                    interpolation=cv2.INTER_NEAREST)
-            lrmask = RoadImage( lrmask,  src_cspace='GRAY')  # gives shape=(h,w,1)
-        elif lrmask == 'auto' or lrmask == 'last':
-            raise NotImplementedError("RoadImage.extract_lines: lrmask='auto' is not implemented.")
-        else:
-            raise ValueError("RoadImage.extract_lines: Valid value of lrmask are None,"+
-                             " 'auto', 'last' or a binary masks collection as long as self.")
-
-        # Options: Undistort and crop image, change colorspace
+        if lrmask is None:  lrmask = state.lrmask
+        # Check lrmask
+        if lrmask is None or lrmask.get_size()!=self.get_size() or not(lrmask.binary) or lrmask.shape[-1]!=1:
+            raise ValueError('RoadImage.extract_lines: lrmask must be binary, single channel, same size as self.')
+        state.lrmask = lrmask
+        
         img = self
-        if cal: img=img.undistort(cal)
-        if crop: img=img.crop(crop)
 
         # The code below is by no means the unique way of getting those images...
         # Colors...
-        imgcol = img.convert_color(RoadImage.extract_lines.cspace).to_float()
+        imgcol = img.convert_color(state.cspace).to_float()
         # Mask and threshold in one operation using 3 channel, per pixel masks
         imgcol.threshold(mini=mini, maxi=maxi, inplace=True)
         imgcol.dilate(iterations=1, inplace=True)
@@ -2499,7 +2483,8 @@ class RoadImage(np.ndarray):
         
     @generic_search()
     @flatten_collection
-    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), curvrange=(-0.001, 0.001), method, save=False):
+    @static_vars(state=None)
+    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), save=True):
         """
         Gets a warped version of self, and looking at the bottom quarter of that image
         Locate the start of the left and right lane lines. 
@@ -2508,216 +2493,296 @@ class RoadImage(np.ndarray):
         of the right lane line.
         If save is true, parameters which can help find lines on the next frame are saved.
         """
-        # TODO: compute mask from curvrange and cal or from existing (past) Lines
-        # Curvature is stored, and curvature filter status too.
+        # Do not work on collections (other than singletons)
+        if self.shape[0]!=1:
+            raise ValueError('RoadImage.find_lines: Must process one image at a time.')
+        if self.colorspace!='RGB' or self.undistorted==False:
+            raise ValueError('RoadImage.find_lines: Must input undistorted, cropped if necessary, RGB image only.')
+        
         from scipy import signal
-        curv_b, curv_a = signal.butter(4, 1/6)
-        
-        rec = self.find_lines_data
-        try:
-            curv_zi = rec.curv_zi
-            curvature = rec.curvature
-            # Adaptive curvrange (all using functions saturate it in the same fashion)
-            curvrange = tuple(curvature + c for c in curvrange)
-        except AttributeError:
-            curv_zi = signal.lfilter_zi(curv_b, curv_a)* 0.5*(curvrange[0]+curvrange[1])
-        
-        # Will not be computed if it exists already
-        filter = self.extract_lines(cal, lrmask=None, mask=None)
-        warped, _ = filter.warp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
 
-        # warp_size returns the size of warped ( warped.get_size() )
-        # and the x position of the camera. They are optimized as a function of curvrange.
-        # The way images are framed depends only on curvrange, so all the images in the
-        # collection yield warped images framed in exactly the same way. origin is the same.
-        dsize, img_cx = RoadImage.warp_size(cal, z=z, h=h, scale=scale, curvrange=curvrange)
-        width,height = dsize
-        sx, sy = scale
-        o = (img_cx, z/sy)
-        z_sol = z - height * sy
+        def reinit_lines(which,lanes=['left','right']):
+            if 'left' in lanes:
+                state.lines.copy(('minusone',),('left',which))
+            if 'right' in lanes:
+                state.lines.copy(('one',),('right',which))
+            if 'farleft' in lanes:
+                state.lines.blend(('farleft',which), key1=('left',which), key2=state.lines.one,
+                                  op='wsum', w1=1, w2=-state.lanew)
+            if 'farright' in lanes:
+                state.lines.blend(('farright',which), key1=('right',which), key2=state.lines.one,
+                                  op='wsum', w1=1, w2=state.lanew)
+            for lane in lanes:
+                if lane in state.sync: state.sync.remove(lane)
+                if not(lane in state.nosync): state.nosync.append(lane)
+                
+        def scoring(lines, key_in, key_out, dir, x, y, der=0):
+            """
+            Scoring of partial solutions in RoadImage.curves.
+            This one penalizes curves which stray far away at short range.
+            """
+            # TODO: survive when key_in does not exist in lines
+            Z0=5 # meters
+            SCALE=1.5
+            x_in  = lines.eval(key_in, z=Z0, der=der)
+            x_out = lines.eval(key_out,z=Z0, der=der)
+            w1 = norm.pdf(x_out, loc=x_in, scale=SCALE)/norm.pdf(0,scale=SCALE)
+            x_out = lines.eval(key_in, z=x, der=der)
+            w2 = exp(-sum((x_out-y)**2)/np.ptp(x))
+            print('scoring:',x_in, x_out, w1, w2)
+            return w1*w2
+
+        def weight(x,y,x0=0.5,z0=100):
+            """
+            Weights of points according to location.
+            """
+            # y is horizontal from reference, x is distance from camera
+            return np.exp(-x**2/z0**2)*np.exp(-y**2/x0**2)
+
+        # Each image in a sequence is typically a new RoadImage instance which enters the pipeline.
+        # The State object carries some information across from one image to the next.
+        class State(object):
+            pass
+
+        # Priority 1 is from self, priority 2 is static storage
+        state = getattr(self, 'slstate', RoadImage.find_lines.state)
+        if state is None:
+            state = State()
+            RoadImage.find_lines.state = state
+            state.nosync = ['left','right']
+            state.sync = []   # up to ['left', 'right'] 
+            state.delta = (0,0)
+            state.curv = 0       # lane curvature
+            state.lanew = 3.7    # lane width
+            state.zmax  = z
+            state.origin = None
+            state.scale = scale
+            state.cal = cal
+            state.lines = self.lines
+            # Filters
+            state.filt_b, state.filt_a = signal.butter(4, 1/6)
+            state.filt_zi = None  # signal.lfilter_zi(state.filt_b, state.filt_a)
+            # Initial lines
+            state.lines.blend(('minusone',), key1=state.lines.zero, 
+                              key2=('one',), op='wsum', w1=0, w2=-1)
+            reinit_lines('last')
+        # Store in self too. self.lines is how we get information out of find_lines().
+        self.slstate = state
+        self.lines = state.lines
         
-        # Allocate space for results, copying the input image in the blue (3rd) channel
-        raw = warped.channels(range(-2,1), isview=False)
-        # Reassign RGB colorspace to display raw lines in blue
-        raw.colorspace = 'RGB'
-        
-        #ret = np.zeros_like(self, dtype=np.float32)
-        ret = self.to_float()
-
-        window_width = 30 
-        window = np.ones(window_width) # Create our window template that we will use for convolutions
-
-        # From the camera position, the search zone for line lanes extends from 0.5m to 3.6m
-        lsearch = range(max(0, int(img_cx - 3.6 / sx)), max(window_width, int(img_cx - 0.5 / sx)))
-        rsearch = range(min(width-window_width, int(img_cx + 0.5 / sx)), min(width, int(img_cx + 3.6 / sx)))
-
-        try:
-            lane_width = rec.lane_width
-            l_center = rec.l_center
-            r_center = rec.r_center
-        except AttributeError:
-            lane_width = None         # Implies that l_center and r_center are undefined too.
-        try:
-            motion = rec.motion
-        except AttributeError:
-            motion = np.zeros(2)
-            
         green = np.array([ 0., 0.9, 0.6, 0.6 ])
         red = np.array([ 1., 0.1, 0., 0.5 ])
+        BLACK = [0,0,0,255]  # Used to erase already identified lanes
 
-        peaksz = self.lines.width / sx
-        peaksz = np.arange(peaksz/2,2*peaksz)
+        # Do the work
+        img = self
+        img.lines = state.lines   # Recall previous lines
         
-        def find_start(bimg):
-            #from scipy import signal
-            
-            # Uses signal, peaksz from external environment
-            #sum = np.sum(bimg, axis=0)
-            #peakind = signal.find_peaks_cwt(sum, peaksz)  # returns an array
-            #assert len(peakind)==1, 'RoadImage.find_lines.find_start:BUG: More than one peak found! %s' % repr(peakind)
-            #print('DEBUG:find_start peaks:',peakind)
-            # Refine location
-            h,_ = bimg.shape
-            subgrid = 4
-            p = np.zeros(2, dtype=np.float64)
-            for i in range(subgrid):
-                for j in range(subgrid):
-                    y,x = np.nonzero(bimg[i::subgrid, j::subgrid])
-                    y = (y*subgrid + i)
-                    x = (x*subgrid + j)
-                    q = np.polyfit(y,x,1)
-                    #print('DEBUG: q(%d,%d)=%s'% (i,j,str(q)))
-                    p += q
-            p /= subgrid*subgrid
-            return int(p[1]+h*p[0])
-                             
-        for ix, img in enumerate(warped):
+        # Theoretical lane appearance and distance to "start of lane".
+        trapeze, _, z_sol = cal.lane(z=z,h=h)
+        
+        # Blend left and right to get median line
+        leftkey = ('left','current')
+        rightkey= ('right','current')
+        
+        if state.lines.exist(leftkey, rightkey):
+            state.lines.blend( ('lane','current'), key1=leftkey, key2=rightkey, op='wavg', w2=0.5 )
 
-            if lane_width is None:
-                l_center = find_start(img[int(.5*img.shape[0]):, lsearch, 0])+lsearch.start
-                r_center = find_start(img[int(.5*img.shape[0]):, rsearch, 0])+rsearch.start
-                print('DEBUG/Line positions: left =',l_center,' right =',r_center)
-            
-            lane_width = int(r_center - l_center)
-
-            raw[ix].channel(1)[:] = method(img, x=l_center, lanew=lane_width, scale=scale)
-            raw[ix].channel(0)[:] = method(img, x=r_center, lanew=lane_width, scale=scale)
-            
-            # Extract line geometry: returns line "density" (i.e dashes or solid) and maximum z achieved for fitting
-            tmotion = tuple(motion.tolist())
-            try:
-                lmotion = np.zeros(2)
-                ldens, lz = self.lines.estimate( ('current','left',ix), raw[ix].channels(1,3), origin=o, scale=scale)
-                try:
-                    lmotion = np.array(self.lines.delta( ('last','left',ix), ('current','left',ix) ))
-                except KeyError:
-                    pass
-            except RuntimeError:
-                self.lines.move( ('last','left',ix), origin=tmotion, dir=0, key2=('current','left',ix)  )
-                ldens, lz = self.lines.stats( ('current','left',ix), 'dens', 'zmax' )
-            try:
-                rmotion = np.zeros(2)
-                rdens, rz = self.lines.estimate(('current','right',ix), raw[ix].channels(range(0,3,2)),
-                                                origin=o, scale=scale)
-                try:
-                    rmotion = np.array(self.lines.delta( ('last','right',ix), ('current','right',ix) ))
-                except KeyError:
-                    pass
-            except RuntimeError:
-                self.lines.move( ('last','right',ix), origin=tmotion, dir=0, key2=('current','right',ix)  )
-                rdens, rz = self.lines.stats( ('current','right',ix), 'dens', 'zmax' )
-
-            # Evaluate lane width ahead
-            #self.lines.blend( ('current','lanew',ix), key1=('current','right',ix), key2=('current','left',ix),
-            #                  w1 = 1, w2 = -1)
-            #lw = self.lines.eval( ('current','lanew',ix), z=np.arange(5,z,10) )
-            
-
-            # vote motion, lmotion, rmotion
-            # Exclude the most distant in Y 
-            if abs(lmotion[1] - motion[1]) > abs(rmotion[1] - motion[1]):
-                nmotion = rmotion
-            else:
-                nmotion = lmotion
-            motion = 0.1*nmotion + 0.9*motion # dampen a lot.
-            if save:
-                self.find_lines_data.motion = motion
-                try:
-                    self.find_lines_data.motion_history.append(motion)
-                except AttributeError:
-                    self.find_lines_data.motion_history = [motion]
-
-            # Use undistorted, warped input image as background for results (uncomment to use)
-            # Option 1: use warped image as background
-            #backgnd = self[ix].warp(cal, z=z, h=h, scale=scale, curvrange=curvrange).to_float()
-            # Option 2: use a black background to observe only the graphics
-            #backgnd = np.zeros(shape=img.shape[:2]+(self.shape[-1],), dtype=np.float32).view(RoadImage)
-            #backgnd._inherit_attributes(img)    # Shape of warped img, but nb_channels and dtype of camera image (self).
-            # Standard is to return unwarped graphics overlaid on image. Leave everything commented out.
-            
-            # Blend left and right to get median line
-            self.lines.blend( ('current','lane',ix), key1=('current','left',ix), key2=('current','right',ix),
-                              op='wavg', w2=0.5 )
             # Measure curvature
-            curvature = self.lines.curvature( ('current','lane',ix) , z=z_sol)
+            curvature = self.lines.curvature( ('lane','current',ix) , z=z_sol)
             curvature, curv_zi = signal.lfilter(curv_b, curv_a, [curvature], zi=curv_zi)
             curvature = curvature[0]
-            if save:
-                self.find_lines_data.curvature = curvature
-                self.find_lines_data.curv_zi = curv_zi
-                
-            # Measure lane width
-            l_center = self.lines.eval( ('current','left',ix), z=z_sol )  
-            r_center = self.lines.eval( ('current','right',ix), z=z_sol ) 
-            lane_width = r_center - l_center
-            if save:
-                self.find_lines_data.lane_width = lane_width
-                self.find_lines_data.r_center = r_center
-                self.find_lines_data.l_center = l_center
+        else:
+            curvature = 0
 
-            backgnd = ret[ix]  # Comment this out to draw on warped images (select background above)
-            cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
-            cv2.putText(backgnd,"%0.2f" % r_center, (int(640 + 100*lane_width/2 - 135), 55),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
-            cv2.line(backgnd,(int(640 - 100*lane_width/2), 70),(int(640 + 100*lane_width/2), 70),
-                     color=green, thickness=2)
-            cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=green, thickness=2)
-            if curvature > 0.0005:
-                cv2.putText(backgnd,"R=%4d m" % int(1/curvature), (860,250),
-                            fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
-            elif curvature < -0.0005:
-                cv2.putText(backgnd,"R=%4d m" % int(-1/curvature), (100,250),
-                            fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        curvrange = (curvature - 0.001, curvature + 0.001)
+        _warpo   = lambda img: img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
+        _warp   = lambda img: _warpo(img)[0]
+        _unwarp = lambda img: img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
+
+        gray = img.to_grayscale()
+        gray = gray.threshold(mini = 0.5)
+        overlay, origin = _warpo(gray)
+        state.origin = (origin[0,0],origin[0,1])
+        _, h,w,ch = overlay.shape
+
+        sums = np.sum(overlay.astype(np.int),axis=(-2,-1))
+        overlay = overlay.to_float().rgb()
+
+        if np.max(sums[0,100:]) > 100:
+            # Light colored pavement ahead
+            # make lrmask
+            lrmask = np.zeros_like(self, dtype=np.uint8)
+            if state.lines.exist(('lane','current')):
+                state.lines.blend( ('infinite','current'), key1=('lane','current'), key2=('one',),
+                                   op='wsum', w1=1, w2=state.zmax)
+                state.lines.draw_area( ('lane','current'), ('infinite','current'), lrmask, 
+                                       origin=state.origin, scale=state.scale, color=[1], 
+                                       warp = _warp, unwarp = _unwarp)
+                # TODO: pass mask as TRAPEZE coordinates when it becomes possible.
+                layer = self.extract_lines(lrmask=lrmask)
+            else:
+                # Use less powerful pixel processing
+                hsv = img.convert_color('HSV')
+                hsv = hsv.threshold(mini = np.array([1.,0.60,0.85]))
+                layer = hsv.combine_masks(op='or',perchannel=False)
                 
+            layer, _ = layer.warp(cal, scale=state.scale)
+            layer = layer.to_float()
+            overlay.channel(2)[:]=layer
+            overlay.channel(0)[(sums>100),:,0] = 0
+
+        pixels = overlay.copy()
+
+        # Clear lanes
+        if 'left' in state.sync and 'right' in state.sync:
+            state.lines.blend(('laneR','current'), key1=('left','current'), key2=('right','current'),
+                              op='wavg', w1=0.1, w2=0.9)
+            state.lines.blend(('laneL','current'), key1=('left','current'), key2=('right','current'),
+                              op='wavg', w1=0.9, w2=0.1)
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
+                                  color=[0,0,0,255])
+        if 'left' in state.sync:
+            state.lines.blend(('laneR','current'), key1=('left','current'), key2=state.lines.one,
+                              op='wsum', w1=1, w2=-0.5)
+            state.lines.blend(('laneL','current'), key1=('left','current'), key2=state.lines.one,
+                              op='wsum', w1=1, w2=-3.)
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
+                                  color=[0,0,0,255])
+
+        if 'right' in state.sync:
+            state.lines.blend(('laneR','current'), key1=('right','current'), key2=state.lines.one,
+                              op='wsum', w1=1, w2=0.5)
+            state.lines.blend(('laneL','current'), key1=('right','current'), key2=state.lines.one,
+                              op='wsum', w1=1, w2=3.)
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
+                                  color=[0,0,0,255])
+
+        # Move the last lines and update them and delta
+        for lane in state.sync:
+            state.lines.copy((lane,'current'),(lane,'last'))
+            state.lines.move((lane,'last'), origin=state.delta, dir=0, key2=(lane,'current'))
+            state.lines.copy((lane,'current'),(lane,'stage3'))
+            overlay.curves((lane,'current'), dir='x', order=4, origin=state.origin, scale=SCALE, 
+                           sfunc=scoring, wfunc=partial(weight,x0=0.2,z0=1000))
+            # TODO: implement test to acknowledge desync here
+            # IF still sync, Erase line (1 m on each side)
+            # Helps the less well-defined lines to resync
+            state.lines.draw((lane,'current'),overlay, origin=state.origin, scale=SCALE, color=BLACK, 
+                             width=state.lanew)
+            #print('Lane '+lane+' delta =', state.lines.delta((lane,'last'),(lane,'current')))
+
+        # Resynchronize
+        while state.nosync:
+            # short hand
+            resync = lambda lane, order,der,x0,z0: overlay.curves((lane,'current'), dir='x', order=order,
+                                                                  origin=state.origin, scale=state.scale,
+                                                                  sfunc=partial(scoring, der=der),
+                                                                  wfunc=partial(weight,x0=x0,z0=z0))
+            if len(state.nosync)>1:
+                # Choose a line
+                state.lines.copy(state.lines.zero, ('lane','current'))
+                resync('lane', order=0, der=1, x0=1, z0=10)
+                #overlay.curves(('lane','current'), dir='x', order=0, origin=origin, scale=SCALE, 
+                #               sfunc=partial(scoring, der=1), wfunc=partial(weight,x0=1,z0=10.))
+                # See where the line starts
+                startx = state.lines.eval(('lane','current'), z=5.)
+                # Depending on sign, search order changes
+                if startx < 0: order = ['left', 'farleft','right','farright']
+                else:          order = ['right', 'farright', 'left', 'farleft']
+                for lane in order:
+                    if lane in state.nosync: break
+                else: # search unsuccessful?
+                    raise RuntimeError('process_image: BUG: garbage in state.nosync?',state.nosync)
+            else:
+                lane = state.nosync[0]  # Only one!
+
+            # Four stage resync:
             
-            l_center = round(img_cx + l_center / sx) # Convert to pixels
-            r_center = round(img_cx + r_center / sx)
+            reinit_lines('current',lanes=[lane])
+            state.lines.copy((lane,'current'),(lane,'stage0'))
+            resync(lane, order=0, der=0, x0=3., z0=10.)
+            #overlay.curves((lane,'current'), dir='x', order=0, origin=origin, scale=SCALE, 
+            #               sfunc=scoring, wfunc=partial(weight,x0=3,z0=10.))
+            state.lines.copy((lane,'current'),(lane,'stage1'))
+            resync(lane, order=1, der=1, x0=1, z0=10)
+            #overlay.curves((lane,'current'), dir='x', order=1, origin=origin, scale=SCALE,
+            #               sfunc=partial(scoring, der=1), wfunc=partial(weight,x0=1,z0=10.))
+            state.lines.copy((lane,'current'),(lane,'stage2'))
+            resync(lane, order=2, der=0, x0=0.5, z0=30)
+            #overlay.curves((lane,'current'), dir='x', order=2, origin=origin, scale=SCALE,
+            #               sfunc=scoring, wfunc=partial(weight,x0=0.5,z0=30))
+            state.lines.copy((lane,'current'),(lane,'stage3'))
+            resync(lane, order=4, der=0, x0=0.2, z0=1000)
+            #overlay.curves((lane,'current'), dir='x', order=4, origin=origin, scale=SCALE, 
+            #               sfunc=scoring, wfunc=partial(weight,x0=0.2,z0=1000))
             
-            # Draw on background image
-            z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
-            if z_max < 0: z_max=0
+            # TODO: evaluate success? curves should return a metric
+            # If there is already a sync'ed line, we can see how stable the distance to that line is.
+            # If it is the first line to synchronize ...
+            if lane in state.nosync:    state.nosync.remove(lane)
+            if not(lane in state.sync): state.sync.append(lane)
+            print('Synchronized lines:', state.sync)
+            # IF sync, Erase newly sync'ed line
+            state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK,
+                             width=state.lanew)
+
+        # Measure lane width
+        l_center = self.lines.eval( leftkey, z=z_sol )  
+        r_center = self.lines.eval( rightkey, z=z_sol ) 
+        lane_width = r_center - l_center
+
+        # TODO: reassess short term camera height based on perceiveed short-distance lane_width.
+        # Camera height is defined by the car's geometry, but it can have short term variations
+        # around an average value due to the car's suspensions. Long term and large variations of
+        # perceived lane width are real changes of the lane width. Note that car height depends
+        # also on loading conditions (and suspensions settings on some luxury cars).
+        # Implementation:
+        #     lane_width --low-pass filter--> real_lw
+        #     lane_wdith - real_lw --> ac_lw
+        #     cam height = f(ac_lw)
+
+        backgnd = img
+        cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        cv2.putText(backgnd,"%0.2f" % r_center, (int(640 + 100*lane_width/2 - 135), 55),
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        cv2.line(backgnd,(int(640 - 100*lane_width/2), 70),(int(640 + 100*lane_width/2), 70),
+                 color=green, thickness=2)
+        cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=green, thickness=2)
+        if curvature > 0.0005:
+            cv2.putText(backgnd,"R=%4d m" % int(1/curvature), (860,250),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        elif curvature < -0.0005:
+            cv2.putText(backgnd,"R=%4d m" % int(-1/curvature), (100,250),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+
+
+        #l_center = round(img_cx + l_center / sx) # Convert to pixels
+        #r_center = round(img_cx + r_center / sx)
+
+        # Draw on background image
+
+        if 'left' in state.sync and 'right' in state.sync:
+            #z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
+            #if z_max < 0: z_max=0
+            z_max=1
             color = green * z_max + red * (1-z_max)
             
-            _warp = lambda img: img.warp(  cal, z=z, h=h, scale=scale, curvrange=curvrange)[0]
-            
-            def _unwarp(img):
-                return img.unwarp(z=z, h=h, scale=scale, curvrange=curvrange, cal=cal)
-            
-            self.lines.draw_area( ('current','left',ix), ('current','right',ix), backgnd,
-                                  origin=o, scale=scale, warp=_warp, unwarp=_unwarp,
-                                  width=lane_width, color=color)
-            self.lines.draw( ('current','left',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
-            self.lines.draw(('current','right',ix), backgnd, origin=o, scale=scale, warp=_warp, unwarp=_unwarp)
+            self.lines.draw_area( leftkey, rightkey, pixels[0], origin=state.origin, scale=scale, color=color,
+                                  warp=_warp, unwarp=_unwarp)
+        # Draw synchronized lanes
+        for lane in state.sync:
+            state.lines.draw((lane,'current'),pixels[0], color=[1.,1.,0.,.6], origin=state.origin, scale=state.scale)
 
-            # To see warped results: erase intermediate results stored in raw, and uncomment 'return raw' below
-            #np.copyto(raw[ix], backgnd, casting='equiv')
+        # To see warped results: erase intermediate results stored in raw, and uncomment 'return raw' below
+        #np.copyto(raw[0], pixels, casting='equiv')
 
         # To see unwarped without the background image, replace ret
         #ret = raw.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
 
-        #return raw
-        return ret
+        return pixels
+        #return img
     
     def centroids(self, *, x, lanew, scale):
         """

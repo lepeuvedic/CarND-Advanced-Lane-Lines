@@ -92,6 +92,7 @@ class Line(ABC):
         self._geom = {}
         return None
 
+    @property
     def zero(self):
         """
         Returns the key under which the representation of y=0 is stored.
@@ -102,12 +103,21 @@ class Line(ABC):
             self.blend(KEY0,key1=('one',),key2=('one',),op='wsum',w1=1,w2=-1)
         return KEY0
 
+    @zero.setter
+    def zero(self, val):
+        raise ValueError('Line.zero: key for zero is a constant (read-only).')
+    
+    @property
     def one(self):
         """
         Returns the key under which the representation of y=1 is stored.
         Derived classes shall define y=1 in their __init__ method, and store it under that key.
         """
         return ('one',)
+
+    @one.setter
+    def one(self, val):
+        raise ValueError('Line.one: key for one is a constant (read-only).')
     
     def move(self, key, *, origin, dir, key2=None):
         """
@@ -222,8 +232,8 @@ class Line(ABC):
 
     def stats(self, key, *args):
         """
-        Returns a tuple. A KeyError exception is thrown if some requested variables are not found. Any value
-        can be passed: lines.stats( key, dens=0, zmax=0 ) --> dens , zmax
+        Returns a tuple. A KeyError exception is thrown if key is not found. Any value
+        can be passed: lines.stats( key, 'dens', 'zmax', 'toto', 'cov' ) --> dens , zmax, None, V
         """
         def value_or_None(d,k):
             try:
@@ -299,6 +309,16 @@ class Line(ABC):
         if val <= 0:
             raise ValueError('Line.width: width must be strictly positive.')
         self._width = val
+
+    def exist(self, *keys):
+        """
+        Return True if all the keys passed as arguments exist, or else return False.
+        """
+        for k in keys:
+            if not(issubclass(type(k), tuple)):
+                raise ValueError('Line.exist: keys must be tuples suitable as dictionary keys.')
+            if not(k in self._geom): return False
+        return True
         
     def draw(self, key, image, *, origin, scale, color=None, width=None, warp=None, unwarp=None):
         """
@@ -343,10 +363,10 @@ class Line(ABC):
             # Create a warped buffer
             buffer = warp(buffer)
 
-        # Color and width processing
+        # Color and width processing (color is stored/normalized as values in [0,255])
         if color is None: color = self.color
         else:             color = Line._normalize_color(color)
-        color = color[:nb_ch]/255.
+        color = color/255.
         if width is None: width = self.width
         
         # Call eval with key to get lane line skeleton in world coordinates
@@ -371,28 +391,28 @@ class Line(ABC):
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=list(color), shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=list(color[:nb_ch]), shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer
             # buffer contains RGBA data, with per pixel alpha
             alpha = buffer.channel(3).to_float()
         else:
-            # Assume alpha is self._color[3] where buffer has _color
-            alpha = np.amax(buffer.to_float(), axis=2, keepdims=True)
-            if len(self.color)>=4:   alphaval = self.color[3]/255.
-            else:                    alphaval = 1.0
-            alpha[(alpha>0.0)] = alphaval
+            # Draw alpha mask
+            alpha = np.zeros_like(buffer.channel(0), subok=True)
+            if len(color)>=4:   alphaval = color[3]
+            else:               alphaval = 1.
+            cv2.fillConvexPoly(alpha, pts, color=[alphaval], shift=shift, lineType=cv2.LINE_AA)
 
         if not(image.warped):
             buffer = unwarp(buffer)
             alpha = unwarp(alpha)
-            
+
         image *= (1-alpha)
         image += (alpha*buffer)
         return None
 
-    def draw_area(self, key1, key2, image, *, origin, scale, color=None, width=None, warp=None, unwarp=None):
+    def draw_area(self, key1, key2, image, *, origin, scale, color=None, warp=None, unwarp=None):
         """
         Draws a smooth graphical representation of the lane line in an image, taking into 
         account origin and scale.
@@ -428,7 +448,7 @@ class Line(ABC):
         # Color processing
         if color is None: color = self.color
         else:             color = Line._normalize_color(color)
-        color = color[:nb_ch]/255.
+        color = color/255.
         
         # Call eval with key to get lane line skeleton in world coordinates
         x0,y0 = origin     # (out of image) pixel coordinates of camera location
@@ -448,24 +468,23 @@ class Line(ABC):
         # and does not self-intersect. Ours is a function and fits the definiion.
         # We work with antialiasing and 3 bits of subpixels: every coordinate is multplied by 8
         shift=3
-        #thick = int(2**shift * width / sx / 2.)
         points_up = [ [int(2**shift * xi), int(2**shift * yi)] for xi,yi in zip(x1,y) ]
         points_dn = [ [int(2**shift * xi), int(2**shift * yi)] for xi,yi in zip(x2,y) ]
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=list(color), shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=list(color[:nb_ch]), shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer
             # buffer contains RGBA data, with per pixel alpha
             alpha = buffer.channel(3).to_float()
         else:
-            # Assume alpha is self._color[3] where buffer has _color
-            alpha = np.amax(buffer.to_float(), axis=2, keepdims=True)
-            if len(self.color)>=4:   alphaval = self.color[3]/255.
-            else:                    alphaval = 1.0
-            alpha[(alpha>0.0)] = alphaval
+            # Draw alpha mask
+            alpha = np.zeros_like(buffer.channel(0), subok=True)
+            if len(color)>=4:   alphaval = color[3]
+            else:               alphaval = 1.
+            cv2.fillConvexPoly(alpha, pts, color=[alphaval], shift=shift, lineType=cv2.LINE_AA)
 
         if not(image.warped):
             buffer = unwarp(buffer)
