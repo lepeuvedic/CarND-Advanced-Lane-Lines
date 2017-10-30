@@ -266,7 +266,7 @@ class CameraCalibration(object):
         a driving lane centered on the camera, starting from the car and extending z real
         units ahead.
         If h is given, instead of placing the camera at camera_height above the trapeze, 
-        the lane will be placed camera_height - h *beelow* the camera. Positive h value
+        the lane will be placed camera_height - h *below* the camera. Positive h value
         describe a hill in front of the car, negative ones, a hole. Note that once the 
         car is established in the upward path on the hillside, the hill ahead may appear
         as sloping down. 

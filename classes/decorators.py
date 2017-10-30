@@ -263,14 +263,16 @@ def generic_search(unlocked = False):
                 ret = f(self,*args, **kwargs)
 
                 if not(ret is None):
-                    # When a method returns several elements, the image is the first
-                    if type(ret) is tuple:     child = ret[0]
-                    else:                      child = ret
-                    # f may return ret = self if nothing to do.
-                    # In this case, there is no new child to reference
-                    if not(child is self):
-                        # Store in cache
-                        self.__add_child__(child, op, unlocked)
+                    if not(isinstance(ret, tuple)):  children = (ret,)
+                    else:                            children = ret
+                    # When a method returns several elements, all things having 'parent'
+                    # and 'find_op' are attached. Practically speaking, only RoadImages are.
+                    for child in children:
+                        # f may return ret = self if nothing to do.
+                        # In this case, there is no new child to reference
+                        if not(child is self) and hasattr(child,'parent') and hasattr(child,'find_op'):
+                            # Store in cache
+                            self.__add_child__(child, op, unlocked)
             return ret
         return gsearch_wrapper
     return gsearch

@@ -162,7 +162,11 @@ class RoadImage(np.ndarray):
 
         # New instance, create new blank instances of Line from default Factory
         # The program can set the default line at any time.
-        # Built from another road image: same family share the instances.
+
+        # Share the Line instances: they are shared across a whole family of related images.
+        # A Line instance can hold multiple geometries, associated with keys in a dict().
+        # If a road image contains a collection, image indexes in the collection can be
+        # a part of the key, in order to store different geometries for each image.
         self.lines    = getattr(obj, 'lines', Line.Factory())
         # Current data of find_lines is also shared in a family
         self.find_lines_data = getattr(obj, 'find_lines_data', _Record())
@@ -277,30 +281,30 @@ class RoadImage(np.ndarray):
                         elif self.shape[-3:-1] == obj.shape[-3:-1] and self.strides[-3:-1] == obj.strides[-3:-1]:
                             # It's a channels operation which kept the first and last channels and eliminated at last one
                             # The step can be deduced from the number of channels in obj and self. The // is exact.
-                            op = ((RoadImage.channels, range(0,obj.shape[-1],(obj.shape[-1]-1)//(self.shape[-1]-1))),)
+                            op = ((RoadImage.channels, (range(0,obj.shape[-1],(obj.shape[-1]-1)//(self.shape[-1]-1)),)),)
                         else:
                             raise NotImplementedError('RoadImage.__array_finalize__ BUG: '
                                                       +'Bad reshape operation done by caller' )
                     else:
-                        op = ((RoadImage.crop, self.crop_area),)
+                        op = ((RoadImage.crop, (self.crop_area,)),)
                 elif self.strides[-3:-1] == obj.strides[-3:-1]:
                     # Some dimensions may be gone but only in the collection layout, and the block is dense,
                     # meaning that the slice arguments did not use a step different from 1.
                     # The width and height strides are the same: it's a crop, maybe with a channels()
                     if coords1[-1] == 0 and coords2[-1] == obj.shape[-1]:
-                        op = ((RoadImage.crop, self.crop_area),)
+                        op = ((RoadImage.crop, (self.crop_area,)),)
                     elif self.strides[-1] == obj.strides[-1] or self.shape[-1]==1:
                         # Extraction of contiguous channels, with or without a crop, and maybe just 1 channel.
-                        op = ((RoadImage.crop, self.crop_area),(RoadImage.channels,coords1[-1],coords2[-1]))
+                        op = ((RoadImage.crop, (self.crop_area,)),(RoadImage.channels,(coords1[-1],coords2[-1])))
                     else:
                         raise NotImplementedError('RoadImage.__array_finalize__ BUG: '
                                                   +'Bad reshape operation done by caller' )
                 elif np.prod(np.array(coords2)-np.array(coords1)) == self.size:
                     # Dense selection: the crop information captures it all.
                     if coords1[-1] == 0 and coords2[-1] == obj.shape[-1]:
-                        op = ((RoadImage.crop, self.crop_area),)
+                        op = ((RoadImage.crop, (self.crop_area,)),)
                     else:
-                        op = ((RoadImage.crop, self.crop_area),(RoadImage.channels,coords1[-1],coords2[-1]))
+                        op = ((RoadImage.crop, (self.crop_area,)),(RoadImage.channels,(coords1[-1],coords2[-1])))
                 else:
                     # General slice: may be keeping 1 pixel in 2
                     # Slicing operations cannot be automatically replayed
@@ -313,12 +317,15 @@ class RoadImage(np.ndarray):
             # If the object we build from is a RoadImage, we link child to parent and parent to child
             # but @generic_search will overwrite this link for operations other than those inferred above.
             if issubclass(type(obj), RoadImage):
-                # Share the Line instances: they are shared across a whole family of related images.
-                # A Line instance can hold multiple geometries, associated with keys in a dict().
-                # If a road image contains a collection, image indexes in the collection can be
-                # a part of the key, in order to store different geometries for each image.
-                
-                if is_inside:  obj.__add_child__(self, op, unlocked=True)
+                # If is_inside, op is already set.
+                if not(is_inside):
+                    if obj.shape == self.shape:
+                        op=((RoadImage.__numpy_like__,),)
+                    else:
+                        op=None
+                        
+                if op:  obj.__add_child__(self, op, unlocked=True)
+                    
                 
             return
         raise TypeError("RoadImage: cast of %s to RoadImage is invalid."% str(type(obj)))
@@ -615,7 +622,7 @@ class RoadImage(np.ndarray):
             for op in ops:
                 # Process each op: there are at most three
                 # (f, args, kwargs), where args and kwargs are optional and kwargs is a dict
-                if not(issubclass(type(op[0]),str)):
+                if not(isinstance(op[0],str)):
                     # It is either a function handle or a str
                     pretty_op=[ op[0].__name__ ]
                 else:
@@ -626,7 +633,7 @@ class RoadImage(np.ndarray):
                         pretty_op.append(RoadImage.pretty_print_ops(a, trim=trim))
                 else:
                     for a in op[1:]:
-                        if not(type(a) is tuple and len(a)>0):
+                        if not(isinstance(a, tuple) and len(a)>0):
                             raise ValueError('RoadImage.pretty_print_ops: Invalid operation format: '+str(a))
                         if a[0] is dict:
                             # named arguments kwargs
@@ -959,7 +966,7 @@ class RoadImage(np.ndarray):
         #for old_op, sibling in parent.child.items():
         #    if sibling is self: break
         if old_op:
-            assert old_op[0][0].__name__ == 'crop' , \
+            assert old_op[0][0].__name__ == 'crop' or old_op[0][0].__name__ == '__numpy_like__', \
                 'RoadImage.__add_child__: BUG: returned instance is already a child. Conflict with %s.' % str(old_op)
             del parent.child[old_op] 
         # Make parent read-only: TODO in the future we would recompute the children automatically
@@ -1266,14 +1273,14 @@ class RoadImage(np.ndarray):
             # Already int
             return self
 
-        # Expensive input tests
-        if np.max(self) > 1.0:
+        # Expensive input tests (magic constants allow some loss of accuracy and still round to 0 or 255)
+        if np.max(self) > 1.00196:
             raise ValueError('RoadImage.to_int: maximum value of input is greater than one.')
         if self.gradient:
-            if np.min(self) < -1.0:
+            if np.min(self) < -1.011:
                 raise ValueError('RoadImage.to_int: minimum value of input is less than minus one.')
         else:
-            if np.min(self) < 0.:
+            if np.min(self) < -0.00196:
                 raise ValueError('RoadImage.to_int: minimum value of input is less than zero.')
 
         if self.gradient:
@@ -1772,22 +1779,24 @@ class RoadImage(np.ndarray):
         and is used to compute an adequate width. It is also a tuple (curv_left, curv_right) and
         the first parameter should be negative, the second positive in 1/meter.
         """
+        from itertools import chain
+        
         # TODO: rectangle should have 2D space coordinates for a 3D mapping
-        offsets=None
         if _unwarp:
             if not(self.warped): raise ValueError('RoadImage.warp: Can only unwarp warped images.')
-            offsets=(0,0)   # Unwarp always unwarps to original camera image size, you can crop again if needed.
+            offsets=(0,0)   # Unwarp always unwarps to original camera image size, then is cropped again.
+            warp_from = self._retrieve_warp()
         else:
             if self.warped:      raise ValueError('RoadImage.warp: Image is already warped.')
-            if self.get_size() == cal.get_size():
-                offsets=(0,0)
+            #if self.get_size() == cal.get_size():
+            #    offsets=(0,0)
+            #else:
+            for p in chain([self], self.parents()):
+                if p.get_size() == cal.get_size():
+                    offsets = self.get_crop(p)[0]  # keep (x1,y1)
+                    break
             else:
-                for p in self.parents():
-                    if p.get_size() == cal.get_size():
-                        offsets = self.get_crop(p)[0]  # keep (x1,y1)
-                        break
-        if offsets is None:
-            raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
+                raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
         
         lcurv, rcurv = curvrange
         sx, sy = scale
@@ -1812,25 +1821,31 @@ class RoadImage(np.ndarray):
         
         # Storage for results
         if _unwarp:
-            if self.get_size() != dsize:
-                raise ValueError('RoadImage.unwarp: Image size does not match size given by RoadImage.warp_size().')
+            # if self.get_size() != dsize:
+            #     raise ValueError('RoadImage.unwarp: Image size does not match size given by RoadImage.warp_size().')
             dsize = cal.get_size()
             
         # Current collection, original image size, current channel count
-        ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype)\
-                .view(RoadImage)
-        ret._inherit_attributes(self)   # Copy most attributes not affected by warping 
+        ret = np.empty(shape=(self.shape[0],dsize[1],dsize[0],self.shape[3]), dtype=self.dtype).view(RoadImage)
 
         if _unwarp:
             for ix,img in enumerate(self):
                 cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix],
                                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
-            ret.warped = False
+            # Compute the crop
+            for p in warp_from.parents():
+                if p.get_size() == cal.get_size():
+                    cropping = warp_from.get_crop(p)
+                    break
+            else:
+                raise ValueError('RoadImage.unwarp: Image size does not match cal.get_size().')
+            ret = ret.crop(cropping)
         else:
             for ix,img in enumerate(self):
                 cv2.warpPerspective(img, persp_mat, dsize=dsize, dst=ret[ix], flags=cv2.INTER_NEAREST)
-            ret.warped = True
 
+        ret._inherit_attributes(self)   # Copy most attributes not affected by warping 
+        ret.warped = not(_unwarp)
         return ret , origin
 
     @strict_accepts(object, tuple)
@@ -2082,12 +2097,26 @@ class RoadImage(np.ndarray):
         """
         pass
 
-    def __numpy__(self):
+    def __numpy_like__(self):
         """
-        Placeholder method used to trace operations done with numpy: e.g a += 1
+        Placeholder method used to trace operations done with numpy: zeros_like, ones_like, empty_like...
         """
         pass
 
+    def _retrieve_warp(self):
+        """
+        Retrieve parent which was warped to self.
+        """
+        if not(self.warped):
+            raise ValueError('RoadImage._retrieve_warp: only applicable to warped images, their likes and their crops.')
+        warp_ops=None
+        for p in self.parents():
+            warp_op = RoadImage.select_ops(self.find_op(parent=p, raw=False, quiet=False), ['warp'])
+            if warp_op: break
+        else:
+            raise ValueError('RoadImage._retrieve_warp: No warp operation found in image history (BUG?).')
+        return p
+    
     def _retrieve_cal(self, cal=None):
         """
         Retrieve cal associated with nearest of wrap, undistort, in the ancestry of
@@ -2214,12 +2243,13 @@ class RoadImage(np.ndarray):
             except (TypeError,ValueError) as e:
                 raise TypeError('RoadImage.curves: arg wfunc must accept 2 or 3 numpy arrays/scalars of the same length.')
         
-        # origin and accumulator
+        # origin and accumulators
         x0,y0 = origin
         resultkey = ('result',current_thread())
         acckey = ('acc',current_thread())  # thread safe key for storage in shared self.lines
         self.lines.copy(self.lines.zero,acckey)  # use thread local key in shared lines dictionary
         acc_w = 0
+        acc_z_max = 0
 
         # Small variant of iterator ensures that the inner loop is on Y after the eventual swap of X and Y.
         if dir=='x':
@@ -2255,6 +2285,7 @@ class RoadImage(np.ndarray):
             # solves, and records the geometry in its private format in self.lines.
             if dir=='x':  # verticals X=f(Y)
                 X,Y = Y,X
+            # From now on, we always solve Y=f(X)
             try:
                 self.lines.copy(key,resultkey)
             except KeyError:
@@ -2281,17 +2312,37 @@ class RoadImage(np.ndarray):
                     newy = int(round(y0 - newY/sy))
                     refval = self[refy, x]
                     newval = self[rewy, x]
-                refw = sum(wfunc(X, np.zeros_like(X), refval))
-                neww = sum(wfunc(X, newY-refY, newval))
+                refW = wfunc(X, np.zeros_like(X), refval)
+                newW = wfunc(X, newY-refY, newval)
             elif wfunc:
-                refw = sum(wfunc(X, np.zeros_like(X)))
-                neww = sum(wfunc(X, newY-refY))
+                refW = wfunc(X, np.zeros_like(X))
+                newW = wfunc(X, newY-refY)
             else:
-                refw = 1.
-                neww = 1.
+                refW = np.ones_like(X)
+                newW = refW
+            refw = sum(refW)
+            neww = sum(newW)
                 
             weight_score = neww/refw
 
+            # Detect loss of lines in image at long distance
+            if dir=='x':
+                z_max = np.max(X)
+                if wfunc:
+                    # We can refine: find z at 90% of total weight neww
+                    for z in range(int(z_max),0,-1):
+                        if sum(newW[(X <= z)])<= 0.90*neww :
+                            z_max = z/0.90 # Increase geometrically (weights tend to spread out much more)
+                            break
+                    else:
+                        warnings.warn("RoadImage.curves: images may be black?", RuntimeWarning)
+                    
+            else:
+                z_max = np.max(Y)
+                warnings.warn("RoadImage.curves: z_max implementation for dir='y' does not yet use wfunc.", RuntimeWarning)
+                # Very crude implementation: we should check if Y leaves the [0,z_max] interval when x is in X, and
+                # if the curve escapes through the top, we should propose a larger z_max.
+                
             ## deriv_bounds test
             # The score is the proportion of the curve which complies with the constraint, stopping
             deriv = self.lines.eval( resultkey, z=X, der=1 )
@@ -2327,6 +2378,7 @@ class RoadImage(np.ndarray):
             # Accumulate solution
             weight = cust_score * weight_score * bounds_score
             acc_w += weight
+            acc_z_max += z_max*weight
             self.lines.blend(acckey,key1=acckey,key2=resultkey,
                              op='wsum', w1=1, w2=weight)
             # Draw solution...
@@ -2336,7 +2388,7 @@ class RoadImage(np.ndarray):
                          op='wsum', w1=0, w2=1/acc_w)
         self.lines.delete(resultkey)
         self.lines.delete(acckey)
-        return
+        return np.array([acc_z_max/acc_w])
         
     # The next section contains specialized operators for autonomous road vehicles
     # - extract_lines does image processing to robustly identify pixels belonging to
@@ -2379,7 +2431,7 @@ class RoadImage(np.ndarray):
             
         if state.mask is None:
             if mask is None:
-                state.mask = np.ones_like(self, dtype=uint8)
+                state.mask = np.ones_like(self.channel(0), dtype=np.uint8)
                 state.mask.binary=True
             else:
                 # TODO: could allow TRAPEZE coordinates as well.
@@ -2392,8 +2444,8 @@ class RoadImage(np.ndarray):
         
         # Outer product of per channel thresholds with per pixel mask.
         # The small offset on minimask ensure that it is larger than maximask on masked pixels
-        mini = np.tensordot(mask, [state.mini], axes=([2],[0]))+0.0001
-        maxi = np.tensordot(mask, [state.maxi], axes=([2],[0]))
+        mini = np.tensordot(mask, [state.mini], axes=([-1],[0]))+0.0001
+        maxi = np.tensordot(mask, [state.maxi], axes=([-1],[0]))
 
         if lrmask is None:  lrmask = state.lrmask
         # Check lrmask
@@ -2523,10 +2575,10 @@ class RoadImage(np.ndarray):
             """
             # TODO: survive when key_in does not exist in lines
             Z0=5 # meters
-            SCALE=1.5
+            NORMSCALE=1.5
             x_in  = lines.eval(key_in, z=Z0, der=der)
             x_out = lines.eval(key_out,z=Z0, der=der)
-            w1 = norm.pdf(x_out, loc=x_in, scale=SCALE)/norm.pdf(0,scale=SCALE)
+            w1 = norm.pdf(x_out, loc=x_in, scale=NORMSCALE)/norm.pdf(0,scale=NORMSCALE)
             x_out = lines.eval(key_in, z=x, der=der)
             w2 = exp(-sum((x_out-y)**2)/np.ptp(x))
             print('scoring:',x_in, x_out, w1, w2)
@@ -2561,7 +2613,7 @@ class RoadImage(np.ndarray):
             state.lines = self.lines
             # Filters
             state.filt_b, state.filt_a = signal.butter(4, 1/6)
-            state.filt_zi = None  # signal.lfilter_zi(state.filt_b, state.filt_a)
+            state.filt_zi = signal.lfilter_zi(state.filt_b, state.filt_a)*state.curv
             # Initial lines
             state.lines.blend(('minusone',), key1=state.lines.zero, 
                               key2=('one',), op='wsum', w1=0, w2=-1)
@@ -2576,7 +2628,7 @@ class RoadImage(np.ndarray):
 
         # Do the work
         img = self
-        img.lines = state.lines   # Recall previous lines
+        #img.lines = state.lines   # Recall previous lines
         
         # Theoretical lane appearance and distance to "start of lane".
         trapeze, _, z_sol = cal.lane(z=z,h=h)
@@ -2589,16 +2641,16 @@ class RoadImage(np.ndarray):
             state.lines.blend( ('lane','current'), key1=leftkey, key2=rightkey, op='wavg', w2=0.5 )
 
             # Measure curvature
-            curvature = self.lines.curvature( ('lane','current',ix) , z=z_sol)
-            curvature, curv_zi = signal.lfilter(curv_b, curv_a, [curvature], zi=curv_zi)
+            curvature = self.lines.curvature( ('lane','current') , z=z_sol)
+            curvature, state.filt_zi = signal.lfilter(state.filt_b, state.filt_a, [curvature], zi=state.filt_zi)
             curvature = curvature[0]
         else:
             curvature = 0
 
         curvrange = (curvature - 0.001, curvature + 0.001)
-        _warpo   = lambda img: img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
-        _warp   = lambda img: _warpo(img)[0]
-        _unwarp = lambda img: img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
+        _warpo   = lambda _img: _img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
+        _warp   = lambda _img: _warpo(_img)[0]
+        _unwarp = lambda _img: _img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
 
         gray = img.to_grayscale()
         gray = gray.threshold(mini = 0.5)
@@ -2611,14 +2663,15 @@ class RoadImage(np.ndarray):
 
         if np.max(sums[0,100:]) > 100:
             # Light colored pavement ahead
-            # make lrmask
-            lrmask = np.zeros_like(self, dtype=np.uint8)
             if state.lines.exist(('lane','current')):
+                # make lrmask
+                lrmask = np.zeros_like(self.channel(0), dtype=np.uint8)
                 state.lines.blend( ('infinite','current'), key1=('lane','current'), key2=('one',),
                                    op='wsum', w1=1, w2=state.zmax)
-                state.lines.draw_area( ('lane','current'), ('infinite','current'), lrmask, 
+                state.lines.draw_area( ('lane','current'), ('infinite','current'), lrmask[0], 
                                        origin=state.origin, scale=state.scale, color=[1], 
                                        warp = _warp, unwarp = _unwarp)
+                lrmask = lrmask.threshold(mini=0.5)  # Would be better to just draw without antialising in this case...
                 # TODO: pass mask as TRAPEZE coordinates when it becomes possible.
                 layer = self.extract_lines(lrmask=lrmask)
             else:
@@ -2627,7 +2680,9 @@ class RoadImage(np.ndarray):
                 hsv = hsv.threshold(mini = np.array([1.,0.60,0.85]))
                 layer = hsv.combine_masks(op='or',perchannel=False)
                 
-            layer, _ = layer.warp(cal, scale=state.scale)
+            #layer,_ = layer.warp(cal, scale=state.scale)
+            layer,_ = layer.warp(cal, scale=state.scale, curvrange=curvrange)
+            #layer = _warp(layer)
             layer = layer.to_float()
             overlay.channel(2)[:]=layer
             overlay.channel(0)[(sums>100),:,0] = 0
@@ -2640,51 +2695,53 @@ class RoadImage(np.ndarray):
                               op='wavg', w1=0.1, w2=0.9)
             state.lines.blend(('laneL','current'), key1=('left','current'), key2=('right','current'),
                               op='wavg', w1=0.9, w2=0.1)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
-                                  color=[0,0,0,255])
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
+                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
         if 'left' in state.sync:
             state.lines.blend(('laneR','current'), key1=('left','current'), key2=state.lines.one,
                               op='wsum', w1=1, w2=-0.5)
             state.lines.blend(('laneL','current'), key1=('left','current'), key2=state.lines.one,
                               op='wsum', w1=1, w2=-3.)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
-                                  color=[0,0,0,255])
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
+                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
 
         if 'right' in state.sync:
             state.lines.blend(('laneR','current'), key1=('right','current'), key2=state.lines.one,
                               op='wsum', w1=1, w2=0.5)
             state.lines.blend(('laneL','current'), key1=('right','current'), key2=state.lines.one,
                               op='wsum', w1=1, w2=3.)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay, origin=state.origin, scale=SCALE,
-                                  color=[0,0,0,255])
+            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
+                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
 
         # Move the last lines and update them and delta
+        # short hand
+        resync = lambda lane, order,der,x0,z0: overlay.curves((lane,'current'), dir='x', order=order,
+                                                              origin=state.origin, scale=state.scale,
+                                                              sfunc=partial(scoring, der=der),
+                                                              wfunc=partial(weight,x0=x0,z0=z0))
         for lane in state.sync:
             state.lines.copy((lane,'current'),(lane,'last'))
             state.lines.move((lane,'last'), origin=state.delta, dir=0, key2=(lane,'current'))
+            # Two stage resync:
+            state.lines.copy((lane,'current'),(lane,'stage2'))
+            resync(lane, order=2, der=0, x0=0.5, z0=30)
             state.lines.copy((lane,'current'),(lane,'stage3'))
-            overlay.curves((lane,'current'), dir='x', order=4, origin=state.origin, scale=SCALE, 
-                           sfunc=scoring, wfunc=partial(weight,x0=0.2,z0=1000))
+            z_max = resync(lane, order=4, der=0, x0=0.2, z0=1000)
             # TODO: implement test to acknowledge desync here
+            #       If the test fails, reinitialize 'current' from 'last' with 'move'.
+            print('Sync z_max %s lane = %4.1f' % (lane, z_max))
             # IF still sync, Erase line (1 m on each side)
             # Helps the less well-defined lines to resync
-            state.lines.draw((lane,'current'),overlay, origin=state.origin, scale=SCALE, color=BLACK, 
+            state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
                              width=state.lanew)
             #print('Lane '+lane+' delta =', state.lines.delta((lane,'last'),(lane,'current')))
 
         # Resynchronize
         while state.nosync:
-            # short hand
-            resync = lambda lane, order,der,x0,z0: overlay.curves((lane,'current'), dir='x', order=order,
-                                                                  origin=state.origin, scale=state.scale,
-                                                                  sfunc=partial(scoring, der=der),
-                                                                  wfunc=partial(weight,x0=x0,z0=z0))
             if len(state.nosync)>1:
                 # Choose a line
                 state.lines.copy(state.lines.zero, ('lane','current'))
                 resync('lane', order=0, der=1, x0=1, z0=10)
-                #overlay.curves(('lane','current'), dir='x', order=0, origin=origin, scale=SCALE, 
-                #               sfunc=partial(scoring, der=1), wfunc=partial(weight,x0=1,z0=10.))
                 # See where the line starts
                 startx = state.lines.eval(('lane','current'), z=5.)
                 # Depending on sign, search order changes
@@ -2700,23 +2757,15 @@ class RoadImage(np.ndarray):
             # Four stage resync:
             
             reinit_lines('current',lanes=[lane])
-            state.lines.copy((lane,'current'),(lane,'stage0'))
+            #state.lines.copy((lane,'current'),(lane,'stage0'))
             resync(lane, order=0, der=0, x0=3., z0=10.)
-            #overlay.curves((lane,'current'), dir='x', order=0, origin=origin, scale=SCALE, 
-            #               sfunc=scoring, wfunc=partial(weight,x0=3,z0=10.))
-            state.lines.copy((lane,'current'),(lane,'stage1'))
+            #state.lines.copy((lane,'current'),(lane,'stage1'))
             resync(lane, order=1, der=1, x0=1, z0=10)
-            #overlay.curves((lane,'current'), dir='x', order=1, origin=origin, scale=SCALE,
-            #               sfunc=partial(scoring, der=1), wfunc=partial(weight,x0=1,z0=10.))
-            state.lines.copy((lane,'current'),(lane,'stage2'))
+            #state.lines.copy((lane,'current'),(lane,'stage2'))
             resync(lane, order=2, der=0, x0=0.5, z0=30)
-            #overlay.curves((lane,'current'), dir='x', order=2, origin=origin, scale=SCALE,
-            #               sfunc=scoring, wfunc=partial(weight,x0=0.5,z0=30))
-            state.lines.copy((lane,'current'),(lane,'stage3'))
-            resync(lane, order=4, der=0, x0=0.2, z0=1000)
-            #overlay.curves((lane,'current'), dir='x', order=4, origin=origin, scale=SCALE, 
-            #               sfunc=scoring, wfunc=partial(weight,x0=0.2,z0=1000))
-            
+            #state.lines.copy((lane,'current'),(lane,'stage3'))
+            z_max = resync(lane, order=4, der=0, x0=0.2, z0=1000)
+            print('Resync z_max %s lane = %4.1f' % (lane,z_max))
             # TODO: evaluate success? curves should return a metric
             # If there is already a sync'ed line, we can see how stable the distance to that line is.
             # If it is the first line to synchronize ...
