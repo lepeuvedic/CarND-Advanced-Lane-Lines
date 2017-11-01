@@ -118,6 +118,12 @@ class Line(ABC):
     @one.setter
     def one(self, val):
         raise ValueError('Line.one: key for one is a constant (read-only).')
+
+    def __iter__(self):
+        """
+        Returns an iterator of the geometries.
+        """
+        return (K for K in self._geom.keys())
     
     def move(self, key, *, origin, dir, key2=None):
         """
@@ -154,10 +160,11 @@ class Line(ABC):
         """
         pass
 
-    def fit(self, key, x, y, func=None, **kwargs):
+    def fit(self, key, x, y, func=None):
         """
         Fit a geometry controlled by additional arguments **kwargs to the points
         given by coordinate arrays x and y. Stores result under 'key'.
+        Requires a working blend(op='wsum') in the calling derived class.
         """
         if func is None:
             # The method does not know how to perform the generic data fit. See LinePoly.fit.
@@ -167,43 +174,24 @@ class Line(ABC):
             # This parent method is useless when there is no pre-existing geometry
             raise ValueError('Line.fit: This method must be called with super() only when key exists.')
 
-        safekey = ('Line.fit',current_thread())
-
-        # does 'blend' support op 'wsum' and is key an existing geometry?
-        try:
+        yref = self.eval(key, z=x)
+        meany = np.mean(y)
+        # Use not in case we have nans.
+        if abs(meany-np.mean(yref)) <= abs(meany):
+            safekey = ('Line.fit',current_thread())
+            # does 'blend' support op 'wsum' and is key an existing geometry?
             self.blend(safekey, key1=key, key2=key, op='wsum', w1=1, w2=0)
             # It worked: 'wsum' exists and we just backed up key to safekey.
             # normalize y in order to better condition matrix
-            y = y - self.eval(safekey, z=x)
-        except NotImplementedError:
-            self.delete(key)  # Can safely call func now, without infinite recursion
-            func(key, x, y, **kwargs)
-            return
-
-        self.delete(key)
-        func(key, x, y, **kwargs)
-        self.blend(key, key1=safekey, key2=key, op='wsum', w1=1, w2=1)
-        self.delete(safekey)
+            y = y - yref
+            self.delete(key)
+            func(key, x, y, deltay=y)
+            self.blend(key, key1=safekey, key2=key, op='wsum', w1=1, w2=1)
+            self.delete(safekey)
+        else:
+            self.delete(key)
+            func(key, x, y, deltay=y - yref)
         return
-
-    @abstractmethod
-    def estimate(self, key, image, *, origin, scale, **kwargs):
-        """
-        Analyses the image to create an analytical representation of a lane line. The image, by
-        definition comes from the camera, and is oriented in the ahead direction (warping corrects
-        the difference between camera center direction and car ahead direction).
-
-        The origin is always below the image at (x=x0, y=height+z_sol / sy). x0 is the second
-        parameter returned by RoadImage.warp_size. height is also provided by this function
-        as part of the tuple it returns as its first return value. z_sol is accessible via y0
-        in origin.
-
-        scale is a tuple (sx,sy) which relates pixels in image to real world coordinates.
-        sx and sy are expressed in m/pixel.
-        
-        key is an arbitrary key the class will use to store the information.
-        """
-        raise NotImplementedError('Line.move: Class Line is not intended to be used directly.')
 
     def blend(self, key, *, key1, key2, **kwargs):
         """
@@ -221,7 +209,7 @@ class Line(ABC):
         Computes real world x coordinates associated to z coordinates supplied as a numpy array.
         z coordinates are distances from the camera.
         """
-        raise NotImplementedError('Line.move: Class Line is not intended to be used directly.')
+        raise NotImplementedError('Line.eval: Class Line is not intended to be used directly.')
 
     def curvature(self, key, *, z):
         """
@@ -242,8 +230,19 @@ class Line(ABC):
                 return None
             
         l = self._geom[key]
+        if len(args)==1:
+            return value_or_None(l,args[0])
         return tuple([ value_or_None(l,k) for k in args])
-            
+
+    def set(self, key, name, val):
+        """
+        Stores arbitrary data with the line.
+        """
+        if name == 'poly':
+            raise ValueError('Line.set: Cannot set poly.')
+        self._geom[key][name] = val
+        return
+        
     @property
     def color(self):
         """
@@ -334,7 +333,8 @@ class Line(ABC):
             # retrieve 'zmax'
             z_max = self._geom[key]['zmax']
         except KeyError:
-            z_max = sy * height
+            z_max = np.inf
+        z_max = min(z_max, sy*height)
 
         try:
             # retrieve 'dens'

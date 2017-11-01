@@ -11,8 +11,8 @@ class LinePoly(Line):
         pone = [1] + [0]*order
         self._geom[('one',)] = { 'poly':pone }
         return None
-        
-    def fit(self, key, x, y, *, order=None, wfunc=None):
+
+    def fit(self, key, x, y, *, order=None, wfunc=None, deltay=None):
         """
         Fit a geometry controlled by additional arguments **kwargs to the points
         given by coordinate arrays x and y, assuming y=f(x).
@@ -27,11 +27,16 @@ class LinePoly(Line):
             raise ValueError('LinePoly.fit: You must increase default order to match requested order %d.' % order)
         
         if type(key) is tuple and key in self._geom:
+            if deltay:
+                raise ValueError('LinePoly.fit: deltay is reserved for library use only.')
             return super().fit(key, x, y, func=partial(self.fit,order=order,wfunc=wfunc))
 
-        # Compute the weights
-        if wfunc: w = wfunc(x,y)
+        # Compute the weights (maybe should check that the weights are reasonably large?)
+        if wfunc: w = wfunc(x,deltay)
         else:     w = None
+        
+        if len(x)<=order:
+            raise ValueError('RoadImage.curves: Not enough points to fit. Is the image black?')
         
         # Fit (returns the polynomial coefficients and the covariance matrix)
         self._geom[key] = { 'op':'fit' } 
@@ -318,7 +323,8 @@ class LinePoly(Line):
             Pout = [ p1*w1+p2*w2 for p1,p2 in zip(P1,P2) ]
 
             from classes import try_apply
-            z_max = try_apply(min, 0, lambda x: self._geom[x]['zmax'], KeyError, key1, key2)
+            # Passing just min as first arg does not work when only one zmax is present. 
+            z_max = try_apply(lambda *x: min(x), 0, lambda x: self._geom[x]['zmax'], KeyError, key1, key2)
         else:
             raise NotImplementedError('LinePoly.blend: operation %s is not yet implemented.' % str(op))
         # Save result

@@ -6,7 +6,7 @@ def try_apply(f=lambda *x: list(x), default=None, expr=lambda x: x, error=ZeroDi
     If all the branches fail, and a default value has been supplied, it is returned, otherwise
     f is called with no arguments.
 
-    Example: try_apply(min, 0, lambda x: l._geom[x]['zmax'], KeyError, key1, key2):
+    Example: try_apply(lambda *x: min(x), 0, lambda x: l._geom[x]['zmax'], KeyError, key1, key2):
     """
     l = []
     for a in args:

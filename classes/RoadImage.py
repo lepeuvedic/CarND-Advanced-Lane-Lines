@@ -13,12 +13,15 @@ from .LinePoly import LinePoly
 import itertools
 from functools import partial
 from threading import current_thread
+from random import shuffle
 
 class _Record(object):
     pass
 
 class RoadImage(np.ndarray):
 
+    unique_id = 0
+    
     # * syntax makes all the following arguments keyword only: they must be used with keyword=value syntax
     # Here they have default values, so they can be missing as well.
     @strict_accepts(object, (None, np.ndarray))
@@ -308,7 +311,8 @@ class RoadImage(np.ndarray):
                 else:
                     # General slice: may be keeping 1 pixel in 2
                     # Slicing operations cannot be automatically replayed
-                    op = ((RoadImage.__slice__,),)
+                    RoadImage.unique_id += 1
+                    op = ((RoadImage.__slice__, (RoadImage.unique_id,)),)
                     warnings.warn('RoadImage.__array_finalize__: deprecated slicing.', DeprecationWarning)
                     # Those cases must be corrected in the caller
             
@@ -320,7 +324,9 @@ class RoadImage(np.ndarray):
                 # If is_inside, op is already set.
                 if not(is_inside):
                     if obj.shape == self.shape:
-                        op=((RoadImage.__numpy_like__,),)
+                        # Operation is generic, but registers what make self unique.
+                        RoadImage.unique_id += 1
+                        op=((RoadImage.__numpy_like__, (RoadImage.unique_id,)),)
                     else:
                         op=None
                         
@@ -948,8 +954,8 @@ class RoadImage(np.ndarray):
         In most cases, self becomes read only, but when ch is a numpy view (changes to self propagate
         automatically since the underlying data is the same), call with unlocked = True.
         """
-        assert issubclass(type(op[0]),tuple), 'RoadImage.__add_child: BUG: Trying to add old-style short op'
-        assert not(issubclass(type(op[0][0]),str)) , 'RoadImage.__add_child__: BUG: Storing string key'
+        assert isinstance(op[0],tuple), 'RoadImage.__add_child: BUG: Trying to add old-style short op'
+        assert not(isinstance(op[0][0],str)) , 'RoadImage.__add_child__: BUG: Storing string key'
 
         # Check if ch is already a child under some other operation
         # A fake crop operation may have been automatically assigned
@@ -974,7 +980,32 @@ class RoadImage(np.ndarray):
         # Link ch to self
         ch.parent = self
         self.child[op] = ch
-        
+        return
+    
+    @static_vars(counter=0,dirname='./output_images/tracking')
+    def track(self):
+        import os
+        from pathlib import Path
+
+        dirname = os.path.normpath(RoadImage.track.dirname)
+        if os.path.exists(dirname):
+            if RoadImage.track.counter == 0:
+                # Clear directory
+                try:
+                    p = Path(dirname)
+                    kill_list = list(p.glob('*.jpg'))
+                except:
+                    pass
+                else:
+                    #print('Track deletes:',kill_list)
+                    for f in kill_list:   f.unlink()
+            RoadImage.track.counter += 1
+            filename = os.path.join(dirname,'track%02d.jpg' % RoadImage.track.counter)
+            self.save(filename, format='jpg')
+        else:
+            warnings.warn('RoadImage.track: dir %s does not exist.' % os.path.abspath(dir))
+        return
+    
     # Save to file
     @strict_accepts(object, str, str)
     def save(self, filename, *, format='png'):
@@ -1406,26 +1437,27 @@ class RoadImage(np.ndarray):
         48 times (0 or 255) for Sobel 5 in x or y.
         4 times (0 or 255) for Sobel 3 in x or y.
         The returned images are scaled by the maximum theoretical value from the table above.
-        tasks is a sublist of [ 'x', 'y', 'angle', 'mag' ].        
+        tasks is a subset of [ 'x', 'y', 'absx', 'absy', 'angle', 'mag' ].        
         """
         from math import sqrt
+        
         # Check content of tasks
-        if not(set(tasks).issubset({'x', 'y', 'mag', 'angle'})):
-            raise ValueError('RoadImage.gradient: Allowed tasks are \'x\',\'y\',\'mag\' and \'angle\'.')
+        if isinstance(tasks, str):
+            # Accept a single task in tasks (as a string)
+            tasks = [tasks]
+            return_as_list = False
+        else:
+            return_as_list = True
+            
+        if not(set(tasks).issubset({'x', 'y', 'absx', 'absy', 'mag', 'angle', 'absangle'})):
+            raise ValueError("RoadImage.gradient: Allowed tasks are 'x','y','absx','absy','mag','angle' and 'absangle'.")
         if sobel_kernel % 2 == 0:
             raise ValueError('RoadImage.gradient: arg sobel_kernel must be an odd integer.')
         if sobel_kernel <= 0:
             raise ValueError('RoadImage.gradient: arg sobel_kernel must be strictly positive.')
         if minmag < 0:
             raise ValueError('RoadImage.gradient: arg minmag must be a non-negative floating point number.')
-
-        # Accept a single task in tasks (as a string)
-        if type(tasks) is str:
-            tasks = [ tasks ]
-            return_as_list = False
-        else:
-            return_as_list = True
-            
+        
         flat = self.flatten()
         
         # Properly synthesize ops (very difficult to be fully compatible with @generic_search)
@@ -1464,10 +1496,10 @@ class RoadImage(np.ndarray):
             flat_ch = self.flatten().channel(ch)
             for img, gray in enumerate(flat_ch):
                 # Loop over each image in the colleciton
-                if ('x' in tasks) or ('mag' in tasks) or ('angle' in tasks):
+                if set(tasks).intersection({'x', 'absx', 'mag', 'angle'}):
                     derx = scalef * cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize = sobel_kernel)
                     abs_derx = np.abs(derx)
-                if ('y' in tasks) or ('mag' in tasks) or ('angle' in tasks):
+                if set(tasks).intersection({'y', 'absy', 'mag', 'angle'}):
                     dery = scalef * cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize = sobel_kernel)
                     abs_dery = np.abs(dery)
                 
@@ -1475,9 +1507,17 @@ class RoadImage(np.ndarray):
                     index = tasks.index('x')
                     grads[index][img].channel(ch)[:] = np.expand_dims(derx,2)
     
+                if 'absx' in tasks:
+                    index = tasks.index('absx')
+                    grads[index][img].channel(ch)[:] = np.expand_dims(abs_derx,2)
+    
                 if 'y' in tasks:
                     index = tasks.index('y')
                     grads[index][img].channel(ch)[:] = np.expand_dims(dery,2) 
+    
+                if 'absy' in tasks:
+                    index = tasks.index('absy')
+                    grads[index][img].channel(ch)[:] = np.expand_dims(abs_dery,2) 
     
                 if ('mag' in tasks) or ('angle' in tasks):
                     # Calculate the magnitude (also used by 'angle' below)
@@ -1492,6 +1532,21 @@ class RoadImage(np.ndarray):
                 if 'angle' in tasks:
                     index = tasks.index('angle')
                     # Use np.arctan2(abs_sobely, abs_sobelx) to calculate the direction of the gradient
+                    aderx = np.copy(derx)
+                    adery = np.copy(dery)
+                    adermask=(derx<0)
+                    aderx[adermask]=-derx[adermask]
+                    adery[adermask]=-dery[adermask]
+                    angle = np.arctan2(adery,aderx)
+                    # Arctan2 returns value between -np.pi/2 and np.pi/2 which are scaled to [-1,1]
+                    scaled = angle/(np.pi/2)
+                    # Apply additional magnitude criterion, otherwise the angle is noisy
+                    scaled[(scaled_grad < minmag)] = 0
+                    grads[index][img,:,:,ch] = scaled
+
+                if 'absangle' in tasks:
+                    index = tasks.index('angle')
+                    # Use np.arctan2(abs_sobely, abs_sobelx) to calculate the direction of the gradient
                     angle = np.arctan2(abs_dery, abs_derx)
                     # Arctan2 returns value between 0 and np.pi/2 which are scaled to [0,1]
                     scaled = angle/(np.pi/2)
@@ -1502,18 +1557,18 @@ class RoadImage(np.ndarray):
         # TODO: Instead of handling ops here, we could have a decorated subfunction, using @generic_search
         # Which takes the same arguments as gradient, but a single task at a time, and grabs already
         # computed results in grads.
-        @generic_search()
-        def gradient(self, task, sobel_kernel, minmag):
+        #@generic_search()
+        #def gradient(self, task, sobel_kernel, minmag):
             # Directly access list variables tasks and grads in 'gradients'
-            i = tasks.index(task)
-            return grads[i]
+        #    i = tasks.index(task)
+        #    return grads[i]
 
         # Return to original shape and set gradient flag
         for i,g in enumerate(grads):
             if tasks[i] != '_':
                 # Only update the new ones
                 # Set gradient flag for x and y which can take negative value
-                g.gradient = (tasks[i] in ['x', 'y'])
+                g.gradient = (tasks[i] in ['x', 'y', 'angle'])
                 grads[i] = g.reshape(self.shape)
                 #TRYME: grads[i] = gradient(self, tasks[i], sobel_kernel = sobel_kernel, minmag = minmag)
 
@@ -1629,9 +1684,9 @@ class RoadImage(np.ndarray):
             raise ValueError('RoadImage.treshold: Specify mini=, maxi= or both.')
         
         # Ensure mini and maxi are iterables, even when supplied as scalars
-        if issubclass(type(mini),float) or issubclass(type(mini),int):
+        if isinstance(mini,float) or isinstance(mini,int):
             mini = np.array([mini], dtype=np.float32)
-        if issubclass(type(maxi),float) or issubclass(type(maxi),int):
+        if isinstance(maxi,float) or isinstance(maxi,int):
             maxi = np.array([maxi], dtype=np.float32)
 
         # Scale, cast and reshape mini according to self.dtype
@@ -1798,7 +1853,6 @@ class RoadImage(np.ndarray):
             else:
                 raise ValueError('RoadImage.warp: Image size does not match cal.get_size().')
         
-        lcurv, rcurv = curvrange
         sx, sy = scale
 
         trapeze, rectangle, z_sol = cal.lane(z=z,h=h)
@@ -2219,6 +2273,9 @@ class RoadImage(np.ndarray):
         
         cnt, h, w, ch = self.shape
 
+        # Per pixel values are fetched only from the first image... subgrids too: 0 is hardcoded in both places. 
+        assert cnt==1, 'RoadImage.curves: BUG! Does not work on multi-image collections.'
+
         # The grid is a stipple pattern made of two slices. The x and y arrays of nonzero pixels are
         # concatenated before passing them to polyfit.
         sx,sy = scale
@@ -2233,15 +2290,15 @@ class RoadImage(np.ndarray):
         wrap_w=False
         if wfunc:
             try:
-                w = float(wfunc(0,0,1.))
-                wrap_w=True
+                w = float(wfunc(0,0,self[0,0,0]))
             except (TypeError,ValueError):
                 # Problem with number of arguments or type of returned value
-                pass
-            try:
-                w = float(wfunc(0,0))
-            except (TypeError,ValueError) as e:
-                raise TypeError('RoadImage.curves: arg wfunc must accept 2 or 3 numpy arrays/scalars of the same length.')
+                try:
+                    w = float(wfunc(0,0))
+                except (TypeError,ValueError) as e:
+                    raise TypeError('RoadImage.curves: arg wfunc must accept 2 or 3 arrays/scalars of the same length.')
+            else:
+                wrap_w=True
         
         # origin and accumulators
         x0,y0 = origin
@@ -2250,6 +2307,9 @@ class RoadImage(np.ndarray):
         self.lines.copy(self.lines.zero,acckey)  # use thread local key in shared lines dictionary
         acc_w = 0
         acc_z_max = 0
+        acc_wsco = 0
+        acc_csco = 0
+        acc_dsco = 0
 
         # Small variant of iterator ensures that the inner loop is on Y after the eventual swap of X and Y.
         if dir=='x':
@@ -2291,7 +2351,7 @@ class RoadImage(np.ndarray):
             except KeyError:
                 key = self.lines.zero
                 self.lines.copy(key, resultkey)
-                
+
             self.lines.fit(resultkey, X, Y, wfunc=weight_func, **kwargs)
 
             # Rate solution (refY cannot be done out of the loop because X changes)
@@ -2299,19 +2359,19 @@ class RoadImage(np.ndarray):
             newY = self.lines.eval(resultkey, z=X)
             ## weight function
             if wrap_w:
-                # iF weight function uses pixel values, we must go back to image and fetch those values
-                if dir=='x': # x=f(Y)
-                    y = int(round(y0 - X/sy))
-                    refx = int(round(refY/sx + x0))
-                    newx = int(round(newY/sx + x0))
-                    refval = self[y, refx]
-                    newval = self[y, newx]
-                else:       # y=f(X)
-                    x = int(round(X/sx + x0))
-                    refy = int(round(y0 - refY/sy))
-                    newy = int(round(y0 - newY/sy))
-                    refval = self[refy, x]
-                    newval = self[rewy, x]
+                # if weight function uses pixel values, we must go back to image and fetch those values
+                if dir=='x': # X=f(Y)
+                    y = np.round(y0 - X/sy).astype(np.intp)
+                    refx = np.round(refY/sx + x0).astype(np.intp)
+                    newx = np.round(newY/sx + x0).astype(np.intp)
+                    refval = self[0, y, refx]
+                    newval = self[0, y, newx]
+                else:       # Y=f(X)
+                    x = np.round(X/sx + x0).astype(np.intp)
+                    refy = np.round(y0 - refY/sy).astype(np.intp)
+                    newy = np.round(y0 - newY/sy).astype(np.intp)
+                    refval = self[0, refy, x]
+                    newval = self[0, rewy, x]
                 refW = wfunc(X, np.zeros_like(X), refval)
                 newW = wfunc(X, newY-refY, newval)
             elif wfunc:
@@ -2336,7 +2396,7 @@ class RoadImage(np.ndarray):
                             break
                     else:
                         warnings.warn("RoadImage.curves: images may be black?", RuntimeWarning)
-                    
+                #print('DEBUG: RoadImage.curves: z_max =',z_max, np.max(X))
             else:
                 z_max = np.max(Y)
                 warnings.warn("RoadImage.curves: z_max implementation for dir='y' does not yet use wfunc.", RuntimeWarning)
@@ -2368,8 +2428,9 @@ class RoadImage(np.ndarray):
                     cust_score = sfunc(self.lines,key,resultkey,dir,X,newY)
                     if cust_score < 0.1 : cust_score=0.1  # do not formally eliminate solutions
                     elif cust_score > 1 : cust_score=1    # cap influence
-                except:
-                    pass
+                except Exception as e:
+                    warnings.warn('RoadImage.curves: custom scoring function exception ignored.\n%s' % str(e),
+                                  RuntimeWarning)
             
             # Debug
             #print('DEBUG: p(%d,%d)='% (i,j), self.lines.stats(resultkey,'poly'))
@@ -2379,6 +2440,9 @@ class RoadImage(np.ndarray):
             weight = cust_score * weight_score * bounds_score
             acc_w += weight
             acc_z_max += z_max*weight
+            acc_csco += cust_score*weight
+            acc_dsco += bounds_score*weight
+            acc_wsco += weight_score*weight
             self.lines.blend(acckey,key1=acckey,key2=resultkey,
                              op='wsum', w1=1, w2=weight)
             # Draw solution...
@@ -2386,6 +2450,10 @@ class RoadImage(np.ndarray):
         # Loop on subgrids finished - normalize result and save under arg key.
         self.lines.blend(key, key1=self.lines.zero, key2=acckey,
                          op='wsum', w1=0, w2=1/acc_w)
+        self.lines.set(key,'csco',acc_csco/acc_w)
+        self.lines.set(key,'dsco',acc_dsco/acc_w)
+        self.lines.set(key,'wsco',acc_wsco/acc_w)
+        self.lines.set(key,'zmax',acc_z_max/acc_w)
         self.lines.delete(resultkey)
         self.lines.delete(acckey)
         return np.array([acc_z_max/acc_w])
@@ -2536,14 +2604,9 @@ class RoadImage(np.ndarray):
     @generic_search()
     @flatten_collection
     @static_vars(state=None)
-    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1), save=True):
+    def find_lines(self, cal, *, z=70, h=0, scale=(.02,.1)):
         """
-        Gets a warped version of self, and looking at the bottom quarter of that image
-        Locate the start of the left and right lane lines. 
-        The result is a small image or image collection, in which pixel[0,0] is the 
-        x pixel coordinate of the left lane line, and pixel[0,1] is the x pixel coordinate
-        of the right lane line.
-        If save is true, parameters which can help find lines on the next frame are saved.
+        Finds the lane lines on an image which has been corrected for distortion.
         """
         # Do not work on collections (other than singletons)
         if self.shape[0]!=1:
@@ -2552,21 +2615,24 @@ class RoadImage(np.ndarray):
             raise ValueError('RoadImage.find_lines: Must input undistorted, cropped if necessary, RGB image only.')
         
         from scipy import signal
+        from scipy.stats import norm
 
-        def reinit_lines(which,lanes=['left','right']):
-            if 'left' in lanes:
-                state.lines.copy(('minusone',),('left',which))
-            if 'right' in lanes:
-                state.lines.copy(('one',),('right',which))
-            if 'farleft' in lanes:
-                state.lines.blend(('farleft',which), key1=('left',which), key2=state.lines.one,
+        def reinit_lines(lines=['left','right']):
+            if 'left' in lines:
+                state.lines.copy(('minusone',),curK('left'))
+            if 'right' in lines:
+                state.lines.copy(('one',),curK('right'))
+            if 'farleft' in lines:
+                state.lines.blend(curK('farleft'), key1=curK('left'), key2=state.lines.one,
                                   op='wsum', w1=1, w2=-state.lanew)
-            if 'farright' in lanes:
-                state.lines.blend(('farright',which), key1=('right',which), key2=state.lines.one,
+            if 'farright' in lines:
+                state.lines.blend(curK('farright'), key1=curK('right'), key2=state.lines.one,
                                   op='wsum', w1=1, w2=state.lanew)
-            for lane in lanes:
-                if lane in state.sync: state.sync.remove(lane)
-                if not(lane in state.nosync): state.nosync.append(lane)
+            for li in lines:
+                state.lines.set(curK(li),'eval',0.001)
+                state.lines.set(curK(li),'order',0)
+                if li in state.sync: state.sync.remove(li)
+                if not(li in state.nosync): state.nosync.append(li)
                 
         def scoring(lines, key_in, key_out, dir, x, y, der=0):
             """
@@ -2577,20 +2643,114 @@ class RoadImage(np.ndarray):
             Z0=5 # meters
             NORMSCALE=1.5
             x_in  = lines.eval(key_in, z=Z0, der=der)
-            x_out = lines.eval(key_out,z=Z0, der=der)
-            w1 = norm.pdf(x_out, loc=x_in, scale=NORMSCALE)/norm.pdf(0,scale=NORMSCALE)
-            x_out = lines.eval(key_in, z=x, der=der)
-            w2 = exp(-sum((x_out-y)**2)/np.ptp(x))
-            print('scoring:',x_in, x_out, w1, w2)
+            x_out1 = lines.eval(key_out,z=Z0, der=der)
+            w1 = norm.pdf(x_out1, loc=x_in, scale=NORMSCALE)/norm.pdf(0,scale=NORMSCALE)
+            x_out2 = lines.eval(key_in, z=x, der=der)
+            w2 = np.exp(-np.sum((x_out2-y)**2)/np.ptp(x)**2)
+            #print('scoring:',x_in, x_out1, w1, w2)
             return w1*w2
 
-        def weight(x,y,x0=0.5,z0=100):
+        def weight(x,y,val,x0=0.5,z0=100):
             """
-            Weights of points according to location.
+            Weights of points according to location and value
             """
             # y is horizontal from reference, x is distance from camera
-            return np.exp(-x**2/z0**2)*np.exp(-y**2/x0**2)
+            # val is RGB, and binary image data can be in any layer.
+            return (np.sum(val,axis=-1)+0.01)*np.exp(-x**2/z0**2)*np.exp(-y**2/x0**2)
 
+        MIN_EVAL = 0.001
+        def eval(key, warpimage, origin, scale, x0, z0):
+            """
+            Returns an evaluation of key as a lane line in a warped image.
+            Buffer must be the same size as self, since state will be used to translate coordinates.
+            The evaluation is the ratio of the number of lit pixels under the line rendering to the
+            total number of lit pixels in the line rendering.
+            """
+            # TODO : should give a bonus for well contrasted sides...
+            assert warpimage.ndim==4, 'RoadImage.find_lines.eval: BUG in warpimage format / must be collection.'
+
+            _,y0 = origin  # Caution: weight() param is also named x0
+            sx,sy = scale
+            
+            linebuf = np.zeros_like(warpimage.channel(0), dtype=np.uint8)[0]
+            # Save and restore z_max and dens (which are taken into account by draw)
+            z_max, dens = state.lines.stats(key, 'zmax','dens')
+            state.lines.set(key,'dens',1)
+            state.lines.set(key,'zmax',linebuf.shape[0]*sy)
+            # Draw a thin line to limit the number of points
+            state.lines.draw(key, linebuf, origin=state.origin, scale=state.scale, color=[255], width=2*sx)
+            linebuf.track()
+            if not(dens is None):  state.lines.set(key,'dens',dens)
+            if not(z_max is None): state.lines.set(key,'zmax',z_max)
+            
+            y, x, _  = np.nonzero(linebuf)
+            val = warpimage[0,y,x]
+            # Convert coordinates
+            Y = (y0-y)*sy
+            # Apply weight (with itself as a reference)
+            w = weight(Y,0,val,x0,z0)
+            wref = weight(Y,0,1,x0,z0)
+            
+            ev = max(MIN_EVAL, np.sum(w)/np.sum(wref))
+            state.lines.set(key,'eval',ev)
+            return ev
+
+        def curK(li_=None):
+            # TODO: add current_thread in tuple. The change would impact initial_estimates().
+            if li_: return (li_, state.counter)
+            return (li,state.counter)
+
+        def stageK(key,stage):
+            return (key[0],state.counter,stage)
+
+        def initial_estimates(lines, keepn=15):
+            """
+            Looks into state.lines to find recent line detections, and produce a list of current initial estimates
+            sorted by decreasing stage of preparation.
+            keepn is the number of recent geometries to use to make a new estimate.
+            """
+            lines_dict = dict()
+            recent = state.counter - keepn
+            linelib= state.lines
+            
+            for K in linelib:
+                if len(K) < 2: continue
+                li, counter = K[:2]
+                if counter < recent or not(li in lines): continue
+                try:
+                    lines_dict[li].append(K)
+                except KeyError:
+                    lines_dict[li] = [ K ]
+
+            for li in lines:
+                try:
+                    it = iter(lines_dict[li])   # KeyError if lines_dict[li] was never created.
+                except KeyError:
+                    # Put zero in the pool as a stage 0 estimate
+                    linelib.copy(state.lines.zero, curK(li))
+                    liblib.set(curK(li),'eval',MIN_EVAL)  # 0.001 is a very low eval. Avoid 0 to make sure total is never 0.
+                else:
+                    K = next(it)          # there is at last one element in the list.
+                    totev = linelib.stats(K, 'eval')
+                    toto = linelib.stats(K, 'order')
+                    total = totev*(1+toto)
+                    linelib.blend(curK(li), op='wsum', key1=linelib.zero, key2=K, w1=1, w2=total)
+                    count = 1
+                    for K in it:
+                        o = linelib.stats(K, 'order')
+                        w = linelib.stats(K, 'eval')
+                        totev += w
+                        toto += o
+                        total += w*(1+o)
+                        count += 1
+                        linelib.blend(curK(li), op='wsum', key1=curK(li), key2=K, w1=1, w2=w*(1+o))
+
+                    linelib.blend(curK(li), op='wsum', key1=curK(li), key2=state.lines.zero, w1=1/total, w2=0)
+                    linelib.set(curK(li),'eval', totev/count) # Average eval
+                    linelib.set(curK(li),'order', toto/count) # Fractional, just to know... doesn't seem to hurt.
+                    
+            return sorted([curK(li) for li in lines], key=lambda K: linelib.stats(K,'eval'), reverse=True)
+                
         # Each image in a sequence is typically a new RoadImage instance which enters the pipeline.
         # The State object carries some information across from one image to the next.
         class State(object):
@@ -2610,6 +2770,7 @@ class RoadImage(np.ndarray):
             state.origin = None
             state.scale = scale
             state.cal = cal
+            state.counter = 0    # frame counter
             state.lines = self.lines
             # Filters
             state.filt_b, state.filt_a = signal.butter(4, 1/6)
@@ -2617,15 +2778,18 @@ class RoadImage(np.ndarray):
             # Initial lines
             state.lines.blend(('minusone',), key1=state.lines.zero, 
                               key2=('one',), op='wsum', w1=0, w2=-1)
-            reinit_lines('last')
+            reinit_lines()
+
         # Store in self too. self.lines is how we get information out of find_lines().
         self.slstate = state
         self.lines = state.lines
-        
-        green = np.array([ 0., 0.9, 0.6, 0.6 ])
-        red = np.array([ 1., 0.1, 0., 0.5 ])
-        BLACK = [0,0,0,255]  # Used to erase already identified lanes
 
+        # Colors
+        GREEN = np.array([ 0., 0.9, 0.6, 0.6 ])
+        RED = np.array([ 1., 0.1, 0., 0.5 ])
+        BLACK = [0,0,0,255]  # Used to erase already identified lanes
+        MAGENTA = [192,0,192,64]
+        
         # Do the work
         img = self
         #img.lines = state.lines   # Recall previous lines
@@ -2634,24 +2798,30 @@ class RoadImage(np.ndarray):
         trapeze, _, z_sol = cal.lane(z=z,h=h)
         
         # Blend left and right to get median line
-        leftkey = ('left','current')
-        rightkey= ('right','current')
-        
+        leftkey = curK('left')
+        rightkey= curK('right')
+
         if state.lines.exist(leftkey, rightkey):
-            state.lines.blend( ('lane','current'), key1=leftkey, key2=rightkey, op='wavg', w2=0.5 )
+            state.lines.blend( curK('lane'), key1=leftkey, key2=rightkey, op='wavg', w2=0.5 )
 
             # Measure curvature
-            curvature = self.lines.curvature( ('lane','current') , z=z_sol)
+            curvature = np.mean(self.lines.curvature( curK('lane') , z=np.array([10,20,30])))
             curvature, state.filt_zi = signal.lfilter(state.filt_b, state.filt_a, [curvature], zi=state.filt_zi)
             curvature = curvature[0]
         else:
             curvature = 0
+        state.curv = curvature
 
-        curvrange = (curvature - 0.001, curvature + 0.001)
+        # Increment image counter in sequence (important to do it AFTER curvature above since curK uses it)
+        state.counter += 1
+        
+        curvrange = (curvature, curvature)
         _warpo   = lambda _img: _img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
         _warp   = lambda _img: _warpo(_img)[0]
         _unwarp = lambda _img: _img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
 
+        # Image preprocessing
+        # -------------------
         gray = img.to_grayscale()
         gray = gray.threshold(mini = 0.5)
         overlay, origin = _warpo(gray)
@@ -2663,7 +2833,7 @@ class RoadImage(np.ndarray):
 
         if np.max(sums[0,100:]) > 100:
             # Light colored pavement ahead
-            if state.lines.exist(('lane','current')):
+            if False: #state.lines.exist(('lane','current')):
                 # make lrmask
                 lrmask = np.zeros_like(self.channel(0), dtype=np.uint8)
                 state.lines.blend( ('infinite','current'), key1=('lane','current'), key2=('one',),
@@ -2675,111 +2845,222 @@ class RoadImage(np.ndarray):
                 # TODO: pass mask as TRAPEZE coordinates when it becomes possible.
                 layer = self.extract_lines(lrmask=lrmask)
             else:
-                # Use less powerful pixel processing
-                hsv = img.convert_color('HSV')
-                hsv = hsv.threshold(mini = np.array([1.,0.60,0.85]))
-                layer = hsv.combine_masks(op='or',perchannel=False)
+                # Use pixel processing from the project walkthrough
+                hsV = img.convert_color('HSV').channel(2).threshold(mini=50/255)
+                hlS = img.convert_color('HLS').channel(2).threshold(mini=100/255)
+                gradx,grady = img.to_grayscale().gradients(tasks=['absx','absy'])
+                gradx.normalize(inplace=True).threshold(mini=12/255, inplace=True)
+                grady.normalize(inplace=True).threshold(mini=25/255, inplace=True)
+                color=RoadImage.make_collection([hsV, hlS], concat=True).combine_masks('and')
+                gxy = RoadImage.make_collection([gradx.to_int(), grady.to_int()], concat=True).combine_masks('and')
+                layer = RoadImage.make_collection([gxy, color], concat=True).combine_masks('or').despeckle()
                 
             #layer,_ = layer.warp(cal, scale=state.scale)
-            layer,_ = layer.warp(cal, scale=state.scale, curvrange=curvrange)
+            layer,_ = layer.warp(state.cal, z=state.zmax, scale=state.scale, curvrange=curvrange)
             #layer = _warp(layer)
             layer = layer.to_float()
-            overlay.channel(2)[:]=layer
-            overlay.channel(0)[(sums>100),:,0] = 0
+            overlay.channel(0)[(sums>100),:,0] = 0 # Clear out bad contrast zones with simple algorithm
+            overlay.channel(0)[(layer>0.5)]=1
 
-        pixels = overlay.copy()
+        # Get initial estimate into curK(line)
+        keys = initial_estimates(['left','right'])
 
-        # Clear lanes
-        if 'left' in state.sync and 'right' in state.sync:
-            state.lines.blend(('laneR','current'), key1=('left','current'), key2=('right','current'),
-                              op='wavg', w1=0.1, w2=0.9)
-            state.lines.blend(('laneL','current'), key1=('left','current'), key2=('right','current'),
-                              op='wavg', w1=0.9, w2=0.1)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
-                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
-        if 'left' in state.sync:
-            state.lines.blend(('laneR','current'), key1=('left','current'), key2=state.lines.one,
-                              op='wsum', w1=1, w2=-0.5)
-            state.lines.blend(('laneL','current'), key1=('left','current'), key2=state.lines.one,
-                              op='wsum', w1=1, w2=-3.)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
-                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
+        # Define realistic masks according to estimate known eval
+        for K in keys:
+            overlay.track()
 
-        if 'right' in state.sync:
-            state.lines.blend(('laneR','current'), key1=('right','current'), key2=state.lines.one,
-                              op='wsum', w1=1, w2=0.5)
-            state.lines.blend(('laneL','current'), key1=('right','current'), key2=state.lines.one,
-                              op='wsum', w1=1, w2=3.)
-            state.lines.draw_area(('laneL','current'),('laneR','current'), overlay[0],
-                                  origin=state.origin, scale=state.scale, color=[0,0,0,255])
+            ev = state.lines.stats(K,'eval')
+            order = state.lines.stats(K,'order')
+            # if order is None:
+            #     order = 0   # Kludge! Find where I forgot
+            #     print("BUG! Key without order:",K)
 
+            while True: # Loop on stages
+                # define mask width in meters based on estimated eval of estimated line
+                der = 0
+                if ev < 0.05:                # stage 0
+                    maskw = (state.lanew - 0.8)*2
+                    order , x0, z0, nextev = 0, 2.5, 15, 0.15
+                elif ev < 0.15 or order < 1: # stage 1 - dashed lines have inherently lower evals
+                    maskw, order, der, x0, z0, nextev = 2, 1, 1, 1, 30, 0.25
+                elif ev < 0.25 or order < 2: # stage 2
+                    maskw, order, x0, z0, nextev = 1, 2, 0.5, 100, 0.7
+                else:                        # stage 3
+                    maskw, order, x0, z0, nextev = 1, 4, 0.5, 1000, 1.0
+
+                # Make a copy and render estimated line as a mask (extending zmax)
+                mask = np.zeros_like(overlay, dtype=np.uint8)
+                
+                z_max = state.lines.stats(K,'zmax')
+                if z_max: state.lines.set(K,'zmax', 2*z_max)
+
+                state.lines.draw(K, mask[0], origin=state.origin, scale=state.scale, color=[255], width=maskw)
+                mask.track()
+                # Further clear points which are not in the overlay
+                mask[overlay==0] = 0
+                print("mask %3.1f m ="% maskw, state.lines.stats(K,'poly'))
+                mask.track()
+                
+                # Shorthand
+                my_eval=partial(eval, warpimage=mask, origin=state.origin, scale=state.scale)
+                # Reassess K: loop until eval tops out
+                ev = my_eval(K, x0=x0, z0=z0)
+                last_eval = ev * .9
+                initial_eval = ev
+                improving = -1   # number of loops ending with a positive test in the while
+                # Mostly useful before the first detection (stage 0):
+                maxiters = 10    # free iterations are needed to iterate until focusing on thin lines or dashed ones.
+                focus_k  = (1/x0)**(1/maxiters)  # the 1st '1' is x0 = 1 meter at stage 1.
+
+                while ev<0.05 or ev>=last_eval*0.99:  # Convergence at one stage
+                    if ev>last_eval*1.03:
+                        improving += 1     
+                        last_eval = ev
+                        state.lines.copy(K,curK('save'))
+                    elif ev>nextev:
+                        # We are not improving any more, but we have reached the ev level for the next higher order.
+                        break
+                    else:
+                        maxiters  -= 1     # else consume one "free" iteration
+                        x0 *= focus_k      # but focus, since distant noise can otherwise keep us just beside a line
+                        z0 /= focus_k**2   # and look farther ahead to try to catch dashes, rather than noise
+                    state.lines.copy(K,stageK(K,'stage'+str(order)))  # DEBUG
+                    z_max = mask.curves(K, dir='x', order=order,
+                                        origin=state.origin, scale=state.scale,
+                                        sfunc=partial(scoring, der=der),
+                                        wfunc=partial(weight,val=1,x0=x0,z0=z0))
+                    ev = my_eval(K, x0=x0, z0=z0)
+                    state.lines.set(K,'order',order)
+                    print('%4.2f,'%ev,end='')
+                    if maxiters == 0: break
+                else:
+                    if improving<1:
+                        print("No improvement at order %d." % order)
+                    # Restore best solution for this stage
+                    state.lines.copy(curK('save'),K)
+                    #state.lines.delete(curK('save'))
+
+                ev, csco, wsco, order, z_max = state.lines.stats(K,'eval','csco','wsco','order','zmax')
+
+                print(" %s : poly ="% str(K), state.lines.stats(K,'poly'))
+                if csco!=None:
+                    print("    zmax = %4.1f  scores: eval = %4.2f  cust = %4.2f  weights = %4.2f"
+                          % (z_max, ev, csco, wsco))
+
+                # eval cannot increase forever: its maximum value is 1.
+                if ev > initial_eval * 1.1:
+                    # Fast convergence
+                    print('+',end='')
+                    #print("Fast convergence!")
+                elif ev <= initial_eval:
+                    # Resync is stuck or has lost sync...
+                    print("Lost sync! ev %6.4f < %6.4f initial_eval" % (ev,initial_eval))
+                    break
+                # Possibly other quality considerations here...
+                if order == 4:
+                    # Slow convergence but order is already the maximum
+                    print("Synchronized.")
+                    if K[0] in state.nosync: state.nosync.remove(K[0])
+                    if not(K[0] in state.sync): state.sync.append(K[0])
+                    # Erase line from overlay: it helps curves focus on the remaining, less visible lines
+                    state.lines.draw(K,overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
+                                     width=maskw)
+                    break
+            # Loop to increase stage
+
+                    
         # Move the last lines and update them and delta
-        # short hand
-        resync = lambda lane, order,der,x0,z0: overlay.curves((lane,'current'), dir='x', order=order,
-                                                              origin=state.origin, scale=state.scale,
-                                                              sfunc=partial(scoring, der=der),
-                                                              wfunc=partial(weight,x0=x0,z0=z0))
-        for lane in state.sync:
-            state.lines.copy((lane,'current'),(lane,'last'))
-            state.lines.move((lane,'last'), origin=state.delta, dir=0, key2=(lane,'current'))
-            # Two stage resync:
-            state.lines.copy((lane,'current'),(lane,'stage2'))
-            resync(lane, order=2, der=0, x0=0.5, z0=30)
-            state.lines.copy((lane,'current'),(lane,'stage3'))
-            z_max = resync(lane, order=4, der=0, x0=0.2, z0=1000)
-            # TODO: implement test to acknowledge desync here
-            #       If the test fails, reinitialize 'current' from 'last' with 'move'.
-            print('Sync z_max %s lane = %4.1f' % (lane, z_max))
-            # IF still sync, Erase line (1 m on each side)
-            # Helps the less well-defined lines to resync
-            state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
-                             width=state.lanew)
-            #print('Lane '+lane+' delta =', state.lines.delta((lane,'last'),(lane,'current')))
+        # shuffle(state.sync)
+        # for lane in state.sync:
+        #     state.lines.copy((lane,'current'),(lane,'last'))
+        #     state.lines.move((lane,'current'), origin=state.delta, dir=0)
+        #     # Two stage resync:
+        #     state.lines.copy((lane,'current'),(lane,'stage2'))
+        #     resync(lane, order=2, der=0, x0=0.5, z0=30)
+        #     state.lines.copy((lane,'current'),(lane,'stage3'))
+        #     z_max2 = resync(lane, order=4, der=0, x0=0.2, z0=1000)
+        #     z_max1 = state.lines.stats((lane,'current'),'zmax')
+        #     if z_max2 < 0.9 * z_max1:
+        #         # Unstable: no sync
+        #         state.sync.remove(lane)
+        #         if not(lane in state.nosync): state.nosync.append(lane)
+        #         # Keep old one
+        #         state.lines.copy((lane,'last'),(lane,'current'))
+        #         state.lines.move((lane,'current'), origin=state.delta, dir=0)
+        #     else:
+        #         print('Sync z_max %s lane = %4.1f' % (lane, z_max1))
+        #     # IF still sync, Erase line (20 cm)
+        #     # It helps the less well-defined lines to resync
+        #     state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
+        #                      width=.2)
+        #     state.lines.draw((lane,'current'),pixels[0], origin=state.origin, scale=state.scale, color=MAGENTA, 
+        #                      width=.2)
+        #     #print('Lane '+lane+' delta =', state.lines.delta((lane,'last'),(lane,'current')))
 
-        # Resynchronize
-        while state.nosync:
-            if len(state.nosync)>1:
-                # Choose a line
-                state.lines.copy(state.lines.zero, ('lane','current'))
-                resync('lane', order=0, der=1, x0=1, z0=10)
-                # See where the line starts
-                startx = state.lines.eval(('lane','current'), z=5.)
-                # Depending on sign, search order changes
-                if startx < 0: order = ['left', 'farleft','right','farright']
-                else:          order = ['right', 'farright', 'left', 'farleft']
-                for lane in order:
-                    if lane in state.nosync: break
-                else: # search unsuccessful?
-                    raise RuntimeError('process_image: BUG: garbage in state.nosync?',state.nosync)
-            else:
-                lane = state.nosync[0]  # Only one!
+        # # Resynchronize
+        # failed = []
+        # while state.nosync:
+        #     if len(state.nosync)>1:
+        #         # Choose a line
+        #         state.lines.copy(state.lines.zero, ('lane','current'))
+        #         resync('lane', order=0, der=1, x0=1, z0=10)
+        #         # See where the line starts
+        #         startx = state.lines.eval(('lane','current'), z=5.)
+        #         # Depending on sign, search order changes
+        #         if startx < 0: order = ['left', 'farleft','right','farright']
+        #         else:          order = ['right', 'farright', 'left', 'farleft']
+        #         for lane in order:
+        #             if lane in state.nosync: break
+        #         else: # search unsuccessful?
+        #             raise RuntimeError('process_image: BUG: garbage in state.nosync?',state.nosync)
+        #     else:
+        #         lane = state.nosync[0]  # Only one!
 
-            # Four stage resync:
+        #     # Four stage resync:
             
-            reinit_lines('current',lanes=[lane])
-            #state.lines.copy((lane,'current'),(lane,'stage0'))
-            resync(lane, order=0, der=0, x0=3., z0=10.)
-            #state.lines.copy((lane,'current'),(lane,'stage1'))
-            resync(lane, order=1, der=1, x0=1, z0=10)
-            #state.lines.copy((lane,'current'),(lane,'stage2'))
-            resync(lane, order=2, der=0, x0=0.5, z0=30)
-            #state.lines.copy((lane,'current'),(lane,'stage3'))
-            z_max = resync(lane, order=4, der=0, x0=0.2, z0=1000)
-            print('Resync z_max %s lane = %4.1f' % (lane,z_max))
-            # TODO: evaluate success? curves should return a metric
-            # If there is already a sync'ed line, we can see how stable the distance to that line is.
-            # If it is the first line to synchronize ...
-            if lane in state.nosync:    state.nosync.remove(lane)
-            if not(lane in state.sync): state.sync.append(lane)
-            print('Synchronized lines:', state.sync)
-            # IF sync, Erase newly sync'ed line
-            state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK,
-                             width=state.lanew)
-
+        #     reinit_lines('current',lanes=[lane])
+        #     state.lines.copy((lane,'current'),(lane,'stage0'))
+        #     resync(lane, order=0, der=0, x0=3., z0=10.)
+        #     state.lines.copy((lane,'current'),(lane,'stage1'))
+        #     resync(lane, order=1, der=1, x0=1, z0=10)
+        #     state.lines.copy((lane,'current'),(lane,'stage2'))
+        #     resync(lane, order=2, der=0, x0=0.5, z0=200)
+        #     state.lines.copy((lane,'current'),(lane,'stage3'))
+        #     z_max1 = resync(lane, order=4, der=0, x0=0.2, z0=1000)
+        #     print('Resync z_max %s lane = %4.1f' % (lane,z_max1), end='')
+            
+        #     # We immediately clear each side of the line and try again to check if we are stable
+        #     clear_lanes([lane])
+        #     state.lines.copy((lane,'last'),(lane,'current'))
+        #     state.lines.move((lane,'current'), origin=state.delta, dir=0)
+        #     # Two stage resync:
+        #     resync('new', order=2, der=0, x0=0.5, z0=30)
+        #     z_max2 = resync('new', order=4, der=0, x0=0.4, z0=1000)
+        #     if z_max2 < 0.8*z_max1:
+        #         print('... failed! z_max2 = %4.1f' % z_max2)
+        #         state.lines.copy((lane,'last'),(lane,'current'))
+        #         state.lines.move((lane,'current'), origin=state.delta, dir=0)
+        #     else:
+        #         print('... stable.')
+        #         state.lines.set((lane,'current'),'zmax',z_max2)
+        #         if not(lane in state.sync): state.sync.append(lane)
+        #         # If sync stable, Erase newly sync'ed line
+        #         state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale,
+        #                          color=BLACK, width=2.)
+        #         state.lines.draw((lane,'current'),pixels[0], origin=state.origin, scale=state.scale,
+        #                          color=MAGENTA, width=2.)
+        #     if lane in state.nosync:
+        #         state.nosync.remove(lane)
+        #         failed.append(lane)
+                
+        # state.nosync = failed
+                
         # Measure lane width
-        l_center = self.lines.eval( leftkey, z=z_sol )  
-        r_center = self.lines.eval( rightkey, z=z_sol ) 
+        l_center = self.lines.eval( curK('left'),  z=z_sol )  
+        r_center = self.lines.eval( curK('right'), z=z_sol ) 
         lane_width = r_center - l_center
+        if lane_width > 3.:  # state.lanew is used in detection: shouldn't wander too far off.
+            state.lanew = lane_width
 
         # TODO: reassess short term camera height based on perceiveed short-distance lane_width.
         # Camera height is defined by the car's geometry, but it can have short term variations
@@ -2793,45 +3074,35 @@ class RoadImage(np.ndarray):
 
         backgnd = img
         cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
-                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
         cv2.putText(backgnd,"%0.2f" % r_center, (int(640 + 100*lane_width/2 - 135), 55),
-                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
         cv2.line(backgnd,(int(640 - 100*lane_width/2), 70),(int(640 + 100*lane_width/2), 70),
-                 color=green, thickness=2)
-        cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=green, thickness=2)
+                 color=GREEN, thickness=2)
+        cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=GREEN, thickness=2)
         if curvature > 0.0005:
             cv2.putText(backgnd,"R=%4d m" % int(1/curvature), (860,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
         elif curvature < -0.0005:
             cv2.putText(backgnd,"R=%4d m" % int(-1/curvature), (100,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
-
-
-        #l_center = round(img_cx + l_center / sx) # Convert to pixels
-        #r_center = round(img_cx + r_center / sx)
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
 
         # Draw on background image
-
         if 'left' in state.sync and 'right' in state.sync:
+            print("z_max =",z_max)
             #z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
             #if z_max < 0: z_max=0
             z_max=1
-            color = green * z_max + red * (1-z_max)
+            color = GREEN * z_max + RED * (1-z_max)
             
-            self.lines.draw_area( leftkey, rightkey, pixels[0], origin=state.origin, scale=scale, color=color,
+            self.lines.draw_area( curK('left'), curK('right'), backgnd[0], origin=state.origin, scale=scale, color=color,
                                   warp=_warp, unwarp=_unwarp)
         # Draw synchronized lanes
-        for lane in state.sync:
-            state.lines.draw((lane,'current'),pixels[0], color=[1.,1.,0.,.6], origin=state.origin, scale=state.scale)
+        for line in state.sync:
+            state.lines.draw(curK(line), backgnd[0], color=[1.,1.,0.,.6], origin=state.origin, scale=state.scale,
+                             warp=_warp, unwarp=_unwarp)
 
-        # To see warped results: erase intermediate results stored in raw, and uncomment 'return raw' below
-        #np.copyto(raw[0], pixels, casting='equiv')
-
-        # To see unwarped without the background image, replace ret
-        #ret = raw.unwarp(cal, z=z, h=h, scale=scale, curvrange=curvrange)
-
-        return pixels
-        #return img
+        return img
     
     def centroids(self, *, x, lanew, scale):
         """
