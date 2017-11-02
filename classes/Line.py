@@ -360,6 +360,7 @@ class Line(ABC):
             buffer = warp(buffer)
 
         height, _, nb_ch = buffer.shape
+
         sx,sy = scale
         try:
             # retrieve 'zmax'
@@ -367,12 +368,11 @@ class Line(ABC):
         except KeyError:
             z_max = np.inf
         z_max = min(z_max, sy*height)
-
+        
         # Color and width processing (color is stored/normalized as values in [0,255])
-        if color is None: color = self.color[:nb_ch]
-        else:             color = Line._normalize_color(color,nb_ch)
-        #if buffer.dtype==np.float32:
-        #color = color/255.
+        if color is None: color = self.color
+        else:             color = Line._normalize_color(color)
+
         if width is None: width = self.width
         
         # Call eval with key to get lane line skeleton in world coordinates
@@ -397,7 +397,7 @@ class Line(ABC):
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=color, shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=color[:nb_ch], shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer
@@ -414,8 +414,14 @@ class Line(ABC):
             buffer = unwarp(buffer)
             alpha = unwarp(alpha)
 
-        image *= (1-alpha)
-        image += (alpha*buffer)
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            image *= (1-alpha)
+            image += (alpha*buffer)
+        else:
+            # Integers
+            alpha = alpha.astype(np.uint16)
+            image[:] = ((image.astype(np.uint16)*(255-alpha))//255).astype(np.uint8)
+            image += ((alpha * buffer)//255).astype(np.uint8)
         return None
 
     def draw_area(self, key1, key2, image, *, origin, scale, color=None, warp=None, unwarp=None):
@@ -452,9 +458,8 @@ class Line(ABC):
             z_max = sy * height
             
         # Color processing
-        if color is None: color = self.color[:nb_ch]
-        else:             color = Line._normalize_color(color, nb_ch)
-        #color = color/255.
+        if color is None: color = self.color
+        else:             color = Line._normalize_color(color)
         
         # Call eval with key to get lane line skeleton in world coordinates
         x0,y0 = origin     # (out of image) pixel coordinates of camera location
@@ -479,7 +484,7 @@ class Line(ABC):
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=color, shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=color[:nb_ch], shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer
@@ -495,7 +500,13 @@ class Line(ABC):
         if not(image.warped):
             buffer = unwarp(buffer)
             alpha = unwarp(alpha)
-            
-        image *= (1-alpha)
-        image += (alpha*buffer)
+
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            image *= (1-alpha)
+            image += (alpha*buffer)
+        else:
+            # Integers
+            alpha = alpha.astype(np.uint16)
+            image[:] = ((image.astype(np.uint16)*(255-alpha))//255).astype(np.uint8)
+            image += ((alpha * buffer)//255).astype(np.uint8)
         return None

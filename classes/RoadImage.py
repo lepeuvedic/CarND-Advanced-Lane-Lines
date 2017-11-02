@@ -1606,7 +1606,7 @@ class RoadImage(np.ndarray):
         if self.binary:
             raise ValueError('RoadImage.normalize: Cannot apply normalize() to binary images.')
 
-        maxi = np.maximum(self, -self)
+        maxi = np.maximum(self, 0-self)
         
         if perchannel:
             if perline:
@@ -2896,9 +2896,6 @@ class RoadImage(np.ndarray):
 
             ev = state.lines.stats(K,'eval')
             order = state.lines.stats(K,'order')
-            # if order is None:
-            #     order = 0   # Kludge! Find where I forgot
-            #     print("BUG! Key without order:",K)
 
             while True: # Loop on stages
                 # define mask width in meters based on estimated eval of estimated line
@@ -2911,7 +2908,7 @@ class RoadImage(np.ndarray):
                 elif ev < 0.25 or order < 2: # stage 2
                     maskw, order, der, x0, z0, nextev = 1, 2, 0, 0.5, 100, 0.7
                 else:                        # stage 3
-                    maskw, order, der, x0, z0, nextev = 1, 4, 0, 0.5, 1000, 1.0
+                    maskw, order, der, x0, z0, nextev = 1, 4, 0, 0.5, 1000, 0.7
 
                 # Make a copy and render estimated line as a mask (extending zmax)
                 mask = np.zeros_like(overlay.channel(0), dtype=np.uint8)
@@ -2934,11 +2931,12 @@ class RoadImage(np.ndarray):
                 initial_eval = ev
                 improving = -1   # number of loops ending with a positive test in the while
                 # Mostly useful before the first detection (stage 0):
-                maxiters = 10    # free iterations are needed to iterate until focusing on thin lines or dashed ones.
+                if order == 0: maxiters = 10
+                else:          maxiters = 3    
                 focus_k  = (1/x0)**(1/maxiters)  # the 1st '1' is x0 = 1 meter at stage 1.
 
                 while ev<0.05 or ev>=last_eval*0.99:  # Convergence at one stage
-                    if ev>last_eval*1.05:
+                    if ev>last_eval*1.08:
                         improving += 1     
                         last_eval = ev
                         state.lines.copy(K,curK('save'))
@@ -2969,9 +2967,9 @@ class RoadImage(np.ndarray):
                 ev, csco, wsco, order, z_max = state.lines.stats(K,'eval','csco','wsco','order','zmax')
 
                 # print(" %s : poly ="% str(K), state.lines.stats(K,'poly'))
-                # if csco!=None:
-                #     print("    zmax = %4.1f  scores: eval = %4.2f  cust = %4.2f  weights = %4.2f"
-                #           % (z_max, ev, csco, wsco))
+                #if csco!=None:
+                #    print("    zmax = %4.1f  scores: eval = %4.2f  cust = %4.2f  weights = %4.2f"
+                #          % (z_max, ev, csco, wsco))
 
                 # eval cannot increase forever: its maximum value is 1.
                 if ev > initial_eval * 1.1:
@@ -3054,13 +3052,15 @@ class RoadImage(np.ndarray):
         if kz < 10: kz = 10
         kz = (kz-10) / (state.zmax-10)      # ratio of achieved z to desired z (full red at 10 m)
         color = (GREEN * kz + RED * (1-kz)).astype(np.uint8)
-        if color[2]>160: print('Exceptional color:',color)
+
+        state.lines.set(leftkey,'zmax',lz)
+        state.lines.set(rightkey,'zmax',rz)
         self.lines.draw_area( leftkey, rightkey, backgnd[0], origin=state.origin, scale=scale, color=color,
                               warp=_warp, unwarp=_unwarp)
         # Draw lane lines
-        state.lines.draw(leftkey, backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
+        state.lines.draw(leftkey,  backgnd[0], color=[255,255,0,200], origin=state.origin, scale=state.scale,
                          warp=_warp, unwarp=_unwarp)
-        state.lines.draw(rightkey, backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
+        state.lines.draw(rightkey, backgnd[0], color=[255,255,0,200], origin=state.origin, scale=state.scale,
                          warp=_warp, unwarp=_unwarp)
 
         return self
