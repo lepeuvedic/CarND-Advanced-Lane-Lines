@@ -2702,11 +2702,13 @@ class RoadImage(np.ndarray):
         def stageK(key,stage):
             return (key[0],state.counter,stage)
 
-        def initial_estimates(lines, keepn=6):
+        def estimates(lines, keepn=6, update=True):
             """
             Looks into state.lines to find recent line detections, and produce a list of current initial estimates
             sorted by decreasing stage of preparation.
             keepn is the number of recent geometries to use to make a new estimate.
+            if update is True, the current values curK(line)  will be updated to reflect the returned values,
+            otherwise the result will be associated to specific keys which will be returned.
             """
             lines_dict = dict()
             recent = state.counter - keepn
@@ -2722,19 +2724,25 @@ class RoadImage(np.ndarray):
                 except KeyError:
                     lines_dict[li] = [ K ]
 
+            target = {}
             for li in lines:
+                if update:   target[li] = curK(li)
+                else:        target[li] = ('tmp'+li,state.counter)
+
+            for li in lines:
+                tgt = target[li]
                 try:
                     it = iter(lines_dict[li])   # KeyError if lines_dict[li] was never created.
                 except KeyError:
                     # Put zero in the pool as a stage 0 estimate
-                    linelib.copy(state.lines.zero, curK(li))
-                    liblib.set(curK(li),'eval',MIN_EVAL)  # 0.001 is a very low eval. Avoid 0 to make sure total is never 0.
+                    linelib.copy(state.lines.zero, tgt)
+                    liblib.set(tgt,'eval',MIN_EVAL)  # 0.001 is a very low eval. Avoid 0 to make sure total is never 0.
                 else:
                     K = next(it)          # there is at last one element in the list.
                     totev = linelib.stats(K, 'eval')
                     toto = linelib.stats(K, 'order')
                     total = totev*(1+toto)
-                    linelib.blend(curK(li), op='wsum', key1=linelib.zero, key2=K, w1=1, w2=total)
+                    linelib.blend(tgt, op='wsum', key1=linelib.zero, key2=K, w1=1, w2=total)
                     count = 1
                     for K in it:
                         o = linelib.stats(K, 'order')
@@ -2743,13 +2751,13 @@ class RoadImage(np.ndarray):
                         toto += o
                         total += w*(1+o)
                         count += 1
-                        linelib.blend(curK(li), op='wsum', key1=curK(li), key2=K, w1=1, w2=w*(1+o))
+                        linelib.blend(tgt, op='wsum', key1=tgt, key2=K, w1=1, w2=w*(1+o))
 
-                    linelib.blend(curK(li), op='wsum', key1=curK(li), key2=state.lines.zero, w1=1/total, w2=0)
-                    linelib.set(curK(li),'eval', totev/count) # Average eval
-                    linelib.set(curK(li),'order', toto/count) # Fractional, just to know... doesn't seem to hurt.
+                    linelib.blend(tgt, op='wsum', key1=tgt, key2=state.lines.zero, w1=1/total, w2=0)
+                    linelib.set(tgt,'eval', totev/count) # Average eval
+                    linelib.set(tgt,'order', toto/count) # Fractional, just to know... doesn't seem to hurt.
                     
-            return sorted([curK(li) for li in lines], key=lambda K: linelib.stats(K,'eval'), reverse=True)
+            return sorted([target[li] for li in lines], key=lambda K: linelib.stats(K,'eval'), reverse=True)
                 
         # Each image in a sequence is typically a new RoadImage instance which enters the pipeline.
         # The State object carries some information across from one image to the next.
@@ -2773,8 +2781,12 @@ class RoadImage(np.ndarray):
             state.counter = 0    # frame counter
             state.lines = self.lines
             # Filters
-            state.filt_b, state.filt_a = signal.butter(4, 1/6)
-            state.filt_zi = signal.lfilter_zi(state.filt_b, state.filt_a)*state.curv
+            state.curv_b, state.curv_a = signal.butter(4, 1/10)
+            state.curv_zi = signal.lfilter_zi(state.curv_b, state.curv_a)*state.curv
+            state.lzmax_b, state.lzmax_a = signal.butter(4, 1/10)
+            state.lzmax_zi = signal.lfilter_zi(state.lzmax_b, state.lzmax_a)*state.lz
+            state.rzmax_b, state.rzmax_a = signal.butter(4, 1/10)
+            state.rzmax_zi = signal.lfilter_zi(state.rzmax_b, state.rzmax_a)*state.rz
             # Initial lines
             state.lines.blend(('minusone',), key1=state.lines.zero, 
                               key2=('one',), op='wsum', w1=0, w2=-1)
@@ -2800,18 +2812,32 @@ class RoadImage(np.ndarray):
         trapeze, _, z_sol = cal.lane(z=z,h=h)
         
         # Blend left and right to get median line
-        leftkey = curK('left')
-        rightkey= curK('right')
 
-        if state.lines.exist(leftkey, rightkey):
-            state.lines.blend( curK('lane'), key1=leftkey, key2=rightkey, op='wavg', w2=0.5 )
+        if state.lines.exist(curK('left'), curK('right')):
+            state.lines.blend( curK('lane'), key1=curK('left'), key2=curK('right'), op='wavg', w2=0.5 )
 
+            # Get and filter z_max
+            lz = state.lines.stats(curK('left'),'zmax')
+            rz = state.lines.stats(curK('right'),'zmax')
+            if lz == None: lz = state.lz
+            if rz == None: rz = state.rz
+            
             # Measure curvature
             curvature = np.mean(self.lines.curvature( curK('lane') , z=np.array([10,20,30])))
-            curvature, state.filt_zi = signal.lfilter(state.filt_b, state.filt_a, [curvature], zi=state.filt_zi)
+
+            # Low pass data
+            curvature, state.curv_zi = signal.lfilter(state.curv_b, state.curv_a, [curvature], zi=state.curv_zi)
             curvature = curvature[0]
+            lz, state.lzmax_zi = signal.lfilter(state.lzmax_b, state.lzmax_a, [lz], zi=state.lzmax_zi)
+            lz = lz[0]
+            state.lz = lz
+            rz, state.rzmax_zi = signal.lfilter(state.rzmax_b, state.rzmax_a, [rz], zi=state.rzmax_zi)
+            rz = rz[0]
+            state.rz = rz
         else:
             curvature = 0
+            lz = state.lz
+            rz = state.rz
         state.curv = curvature
 
         # Increment image counter in sequence (important to do it AFTER curvature above since curK uses it)
@@ -2844,27 +2870,15 @@ class RoadImage(np.ndarray):
 
         if np.max(sums[0,100:]) > 100:
             # Light colored pavement ahead
-            if False: #state.lines.exist(('lane','current')):
-                # make lrmask
-                lrmask = np.zeros_like(self.channel(0), dtype=np.uint8)
-                state.lines.blend( ('infinite','current'), key1=('lane','current'), key2=('one',),
-                                   op='wsum', w1=1, w2=state.zmax)
-                state.lines.draw_area( ('lane','current'), ('infinite','current'), lrmask[0], 
-                                       origin=state.origin, scale=state.scale, color=[1], 
-                                       warp = _warp, unwarp = _unwarp)
-                lrmask = lrmask.threshold(mini=0.5)  # Would be better to just draw without antialising in this case...
-                # TODO: pass mask as TRAPEZE coordinates when it becomes possible.
-                layer = self.extract_lines(lrmask=lrmask)
-            else:
-                # Use pixel processing from the project walkthrough
-                hsV = img.convert_color('HSV').channel(2).threshold(mini=50/255)
-                hlS = img.convert_color('HLS').channel(2).threshold(mini=100/255)
-                gradx,grady = img.to_grayscale().gradients(tasks=['absx','absy'])
-                gradx.normalize(inplace=True).threshold(mini=12/255, inplace=True)
-                grady.normalize(inplace=True).threshold(mini=25/255, inplace=True)
-                color=RoadImage.make_collection([hsV, hlS], concat=True).combine_masks('and')
-                gxy = RoadImage.make_collection([gradx.to_int(), grady.to_int()], concat=True).combine_masks('and')
-                layer = RoadImage.make_collection([gxy, color], concat=True).combine_masks('or').despeckle()
+            # Use pixel processing from the project walkthrough
+            hsV = img.convert_color('HSV').channel(2).threshold(mini=50/255)
+            hlS = img.convert_color('HLS').channel(2).threshold(mini=100/255)
+            gradx,grady = img.to_grayscale().gradients(tasks=['absx','absy'])
+            gradx.normalize(inplace=True).threshold(mini=12/255, inplace=True)
+            grady.normalize(inplace=True).threshold(mini=25/255, inplace=True)
+            color=RoadImage.make_collection([hsV, hlS], concat=True).combine_masks('and')
+            gxy = RoadImage.make_collection([gradx.to_int(), grady.to_int()], concat=True).combine_masks('and')
+            layer = RoadImage.make_collection([gxy, color], concat=True).combine_masks('or').despeckle()
                 
             #layer,_ = layer.warp(cal, scale=state.scale)
             layer,_ = layer.warp(state.cal, z=state.zmax, scale=state.scale, curvrange=curvrange)
@@ -2874,7 +2888,7 @@ class RoadImage(np.ndarray):
             overlay.channel(0)[(layer>0.5)]=1
 
         # Get initial estimate into curK(line)
-        keys = initial_estimates(['left','right'])
+        keys = estimates(['left','right'], keepn=10)
 
         # Define realistic masks according to estimate known eval
         for K in keys:
@@ -2890,14 +2904,14 @@ class RoadImage(np.ndarray):
                 # define mask width in meters based on estimated eval of estimated line
                 der = 0
                 if ev < 0.05:                # stage 0
-                    maskw = (state.lanew - 0.8)*2
-                    order , x0, z0, nextev = 0, 2.5, 15, 0.15
+                    #maskw = (state.lanew - 0.8)*2
+                    maskw, order, der, x0, z0, nextev = 3, 0, 0, 2.5, 15, 0.15
                 elif ev < 0.15 or order < 1: # stage 1 - dashed lines have inherently lower evals
                     maskw, order, der, x0, z0, nextev = 2, 1, 1, 1, 30, 0.25
                 elif ev < 0.25 or order < 2: # stage 2
-                    maskw, order, x0, z0, nextev = 1, 2, 0.5, 100, 0.7
+                    maskw, order, der, x0, z0, nextev = 1, 2, 0, 0.5, 100, 0.7
                 else:                        # stage 3
-                    maskw, order, x0, z0, nextev = 1, 4, 0.5, 1000, 1.0
+                    maskw, order, der, x0, z0, nextev = 1, 4, 0, 0.5, 1000, 1.0
 
                 # Make a copy and render estimated line as a mask (extending zmax)
                 mask = np.zeros_like(overlay.channel(0), dtype=np.uint8)
@@ -2982,25 +2996,22 @@ class RoadImage(np.ndarray):
             # Loop to increase stage
 
         # Detection finished. In case of failures to detect, we generate solutions from past solutions
-        if state.lines.exist(curK('left')):
-            lz = state.lines.stats(curK('left'),'zmax')
-            if lz: state.lz = lz
-        else:
-            initial_estimates(['left'], keepn=6)
-            state.lz *= 0.9
-    
-        if state.lines.exist(curK('right')):
-            rz = state.lines.stats(curK('right'),'zmax')
-            if rz: state.rz = rz
-        else:
-            initial_estimates(['right'], keepn=6)
-            state.rz *= 0.9
+        
+        leftkey, rightkey = estimates(['left','right'], keepn=6, update=False)
                
+        lz = state.lines.stats(leftkey,'zmax')
+        if lz is None and state.lz > 5: state.lz -= 1
+        lz = state.lz
+        
+        rz = state.lines.stats(rightkey,'zmax')
+        if rz is None and state.rz > 5: state.rz -= 1
+        rz = state.rz
+            
         # Measure lane width
         distk = np.array([1,2,3])
         # eval at low multiples of z_sol since farther out there are perspective errors 
-        l_center = np.mean(self.lines.eval( curK('left'),  z=z_sol*distk ))
-        r_center = np.mean(self.lines.eval( curK('right'), z=z_sol*distk ))
+        l_center = np.mean(self.lines.eval( leftkey,  z=z_sol*distk ))
+        r_center = np.mean(self.lines.eval( rightkey, z=z_sol*distk ))
         lane_width = r_center - l_center
         if lane_width > 3.5 and lane_width < 3.9 :
             # state.lanew is used in detection: shouldn't wander too far off.
@@ -3032,21 +3043,25 @@ class RoadImage(np.ndarray):
         cv2.circle(backgnd[0],(int(640 - 100*(state.lanew/2 + l_center)), 70), 10, color=green, thickness=2)
         if curvature > 0.0005:
             cv2.putText(backgnd[0],"R=%4d m" % int(1/curvature), (860,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green[:3], thickness=2)
         elif curvature < -0.0005:
             cv2.putText(backgnd[0],"R=%4d m" % int(-1/curvature), (100,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green[:3], thickness=2)
 
         # Draw on background image
-        z_max = (min(state.lz,state.rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
-        if z_max < 0: z_max=0
-        color = (GREEN * z_max + RED * (1-z_max)).astype(np.uint8)
-        self.lines.draw_area( curK('left'), curK('right'), backgnd[0], origin=state.origin, scale=scale, color=color,
+        kz = min(lz,rz)
+        if kz > state.zmax: kz = state.zmax
+        if kz < 10: kz = 10
+        kz = (kz-10) / (state.zmax-10)      # ratio of achieved z to desired z (full red at 10 m)
+        color = (GREEN * kz + RED * (1-kz)).astype(np.uint8)
+        if color[2]>160: print('Exceptional color:',color)
+        self.lines.draw_area( leftkey, rightkey, backgnd[0], origin=state.origin, scale=scale, color=color,
                               warp=_warp, unwarp=_unwarp)
-        # Draw synchronized lanes
-        for line in ['left','right']:
-            state.lines.draw(curK(line), backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
-                             warp=_warp, unwarp=_unwarp)
+        # Draw lane lines
+        state.lines.draw(leftkey, backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
+                         warp=_warp, unwarp=_unwarp)
+        state.lines.draw(rightkey, backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
+                         warp=_warp, unwarp=_unwarp)
 
         return self
     
