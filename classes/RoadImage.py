@@ -2832,7 +2832,7 @@ class RoadImage(np.ndarray):
         # -------------------
         gray = img.to_grayscale()
         gray = gray.threshold(mini = 0.5)
-        import pdb;pdb.set_trace()
+
         overlay, origin = gray._warpo() #_warpo(gray)
         state.origin = (origin[0,0],origin[0,1])
         _, _,w,ch = overlay.shape
