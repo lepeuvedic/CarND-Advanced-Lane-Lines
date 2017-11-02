@@ -2785,13 +2785,15 @@ class RoadImage(np.ndarray):
         self.lines = state.lines
 
         # Colors
-        GREEN = np.array([ 0, 229, 153, 100 ])
-        RED = np.array([ 255, 25, 0., 128 ])
+        GREEN = np.array([ 0, 229, 153, 50 ])
+        RED = np.array([ 255, 25, 0, 128 ])
         BLACK = [0,0,0,255]  # Used to erase already identified lanes
         MAGENTA = [192,0,192,64]
         
         # Do the work
-        img = self
+        _, aheady = cal.get_ahead(state.curv)
+        crop = slice(aheady,656)
+        img = self[:,crop]
         #img.lines = state.lines   # Recall previous lines
         
         # Theoretical lane appearance and distance to "start of lane".
@@ -2941,11 +2943,11 @@ class RoadImage(np.ndarray):
                     ev = my_eval(K, x0=x0, z0=z0)
                     state.lines.set(K,'order',order)
                     #print('%4.2f,'%ev,end='')
-                    print('.',end='')
+                    #print('.',end='')
                     if maxiters == 0: break
                 else:
-                    if improving<1:
-                        print("No improvement at order %d." % order)
+                    #if improving<1:
+                    #    print("No improvement at order %d." % order)
                     # Restore best solution for this stage
                     state.lines.copy(curK('save'),K)
                     state.lines.delete(curK('save'))
@@ -2960,8 +2962,9 @@ class RoadImage(np.ndarray):
                 # eval cannot increase forever: its maximum value is 1.
                 if ev > initial_eval * 1.1:
                     # Fast convergence
-                    print('+',end='')
+                    #print('+',end='')
                     #print("Fast convergence!")
+                    continue
                 elif order == 4:
                     #print("Synchronized.")
                     # Erase line from overlay: it helps curves focus on the remaining, less visible lines
@@ -3017,7 +3020,8 @@ class RoadImage(np.ndarray):
         #     lane_wdith - real_lw --> ac_lw
         #     cam height = f(ac_lw)
 
-        backgnd = img
+        self[:,crop] = img
+        backgnd = self
         green = GREEN.tolist()
         cv2.putText(backgnd[0],"%0.2f" % (-l_center), (int(640 - 100*state.lanew/2), 55),
                     fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
@@ -3044,7 +3048,7 @@ class RoadImage(np.ndarray):
             state.lines.draw(curK(line), backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
                              warp=_warp, unwarp=_unwarp)
 
-        return backgnd
+        return self
     
     def centroids(self, *, x, lanew, scale):
         """
