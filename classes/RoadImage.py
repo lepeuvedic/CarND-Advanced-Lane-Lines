@@ -984,6 +984,7 @@ class RoadImage(np.ndarray):
     
     @static_vars(counter=0,dirname='./output_images/tracking')
     def track(self):
+        return  # comment this line out to log find_lines inner working.
         import os
         from pathlib import Path
 
@@ -2703,7 +2704,7 @@ class RoadImage(np.ndarray):
         def stageK(key,stage):
             return (key[0],state.counter,stage)
 
-        def initial_estimates(lines, keepn=15):
+        def initial_estimates(lines, keepn=6):
             """
             Looks into state.lines to find recent line detections, and produce a list of current initial estimates
             sorted by decreasing stage of preparation.
@@ -2898,7 +2899,7 @@ class RoadImage(np.ndarray):
                 mask.track()
                 # Further clear points which are not in the overlay
                 mask[overlay==0] = 0
-                print("mask %3.1f m ="% maskw, state.lines.stats(K,'poly'))
+                #print("mask %3.1f m ="% maskw, state.lines.stats(K,'poly'))
                 mask.track()
                 
                 # Shorthand
@@ -2913,7 +2914,7 @@ class RoadImage(np.ndarray):
                 focus_k  = (1/x0)**(1/maxiters)  # the 1st '1' is x0 = 1 meter at stage 1.
 
                 while ev<0.05 or ev>=last_eval*0.99:  # Convergence at one stage
-                    if ev>last_eval*1.03:
+                    if ev>last_eval*1.05:
                         improving += 1     
                         last_eval = ev
                         state.lines.copy(K,curK('save'))
@@ -2931,21 +2932,22 @@ class RoadImage(np.ndarray):
                                         wfunc=partial(weight,val=1,x0=x0,z0=z0))
                     ev = my_eval(K, x0=x0, z0=z0)
                     state.lines.set(K,'order',order)
-                    print('%4.2f,'%ev,end='')
+                    #print('%4.2f,'%ev,end='')
+                    print('.',end='')
                     if maxiters == 0: break
                 else:
                     if improving<1:
                         print("No improvement at order %d." % order)
                     # Restore best solution for this stage
                     state.lines.copy(curK('save'),K)
-                    #state.lines.delete(curK('save'))
+                    state.lines.delete(curK('save'))
 
                 ev, csco, wsco, order, z_max = state.lines.stats(K,'eval','csco','wsco','order','zmax')
 
-                print(" %s : poly ="% str(K), state.lines.stats(K,'poly'))
-                if csco!=None:
-                    print("    zmax = %4.1f  scores: eval = %4.2f  cust = %4.2f  weights = %4.2f"
-                          % (z_max, ev, csco, wsco))
+                # print(" %s : poly ="% str(K), state.lines.stats(K,'poly'))
+                # if csco!=None:
+                #     print("    zmax = %4.1f  scores: eval = %4.2f  cust = %4.2f  weights = %4.2f"
+                #           % (z_max, ev, csco, wsco))
 
                 # eval cannot increase forever: its maximum value is 1.
                 if ev > initial_eval * 1.1:
@@ -2953,13 +2955,17 @@ class RoadImage(np.ndarray):
                     print('+',end='')
                     #print("Fast convergence!")
                 elif ev <= initial_eval:
-                    # Resync is stuck or has lost sync...
-                    print("Lost sync! ev %6.4f < %6.4f initial_eval" % (ev,initial_eval))
+                    # Resync is stuck
+                    if order == 4: break  # not an issue when we are already at order 4
+                    if ev <= initial_eval * 0.9:
+                        print("Lost sync! ev %6.4f < %6.4f initial_eval" % (ev,initial_eval))
+                        # eliminate solution from pool
+                        state.lines.delete(K)
                     break
                 # Possibly other quality considerations here...
                 if order == 4:
                     # Slow convergence but order is already the maximum
-                    print("Synchronized.")
+                    #print("Synchronized.")
                     if K[0] in state.nosync: state.nosync.remove(K[0])
                     if not(K[0] in state.sync): state.sync.append(K[0])
                     # Erase line from overlay: it helps curves focus on the remaining, less visible lines
@@ -2969,91 +2975,6 @@ class RoadImage(np.ndarray):
             # Loop to increase stage
 
                     
-        # Move the last lines and update them and delta
-        # shuffle(state.sync)
-        # for lane in state.sync:
-        #     state.lines.copy((lane,'current'),(lane,'last'))
-        #     state.lines.move((lane,'current'), origin=state.delta, dir=0)
-        #     # Two stage resync:
-        #     state.lines.copy((lane,'current'),(lane,'stage2'))
-        #     resync(lane, order=2, der=0, x0=0.5, z0=30)
-        #     state.lines.copy((lane,'current'),(lane,'stage3'))
-        #     z_max2 = resync(lane, order=4, der=0, x0=0.2, z0=1000)
-        #     z_max1 = state.lines.stats((lane,'current'),'zmax')
-        #     if z_max2 < 0.9 * z_max1:
-        #         # Unstable: no sync
-        #         state.sync.remove(lane)
-        #         if not(lane in state.nosync): state.nosync.append(lane)
-        #         # Keep old one
-        #         state.lines.copy((lane,'last'),(lane,'current'))
-        #         state.lines.move((lane,'current'), origin=state.delta, dir=0)
-        #     else:
-        #         print('Sync z_max %s lane = %4.1f' % (lane, z_max1))
-        #     # IF still sync, Erase line (20 cm)
-        #     # It helps the less well-defined lines to resync
-        #     state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
-        #                      width=.2)
-        #     state.lines.draw((lane,'current'),pixels[0], origin=state.origin, scale=state.scale, color=MAGENTA, 
-        #                      width=.2)
-        #     #print('Lane '+lane+' delta =', state.lines.delta((lane,'last'),(lane,'current')))
-
-        # # Resynchronize
-        # failed = []
-        # while state.nosync:
-        #     if len(state.nosync)>1:
-        #         # Choose a line
-        #         state.lines.copy(state.lines.zero, ('lane','current'))
-        #         resync('lane', order=0, der=1, x0=1, z0=10)
-        #         # See where the line starts
-        #         startx = state.lines.eval(('lane','current'), z=5.)
-        #         # Depending on sign, search order changes
-        #         if startx < 0: order = ['left', 'farleft','right','farright']
-        #         else:          order = ['right', 'farright', 'left', 'farleft']
-        #         for lane in order:
-        #             if lane in state.nosync: break
-        #         else: # search unsuccessful?
-        #             raise RuntimeError('process_image: BUG: garbage in state.nosync?',state.nosync)
-        #     else:
-        #         lane = state.nosync[0]  # Only one!
-
-        #     # Four stage resync:
-            
-        #     reinit_lines('current',lanes=[lane])
-        #     state.lines.copy((lane,'current'),(lane,'stage0'))
-        #     resync(lane, order=0, der=0, x0=3., z0=10.)
-        #     state.lines.copy((lane,'current'),(lane,'stage1'))
-        #     resync(lane, order=1, der=1, x0=1, z0=10)
-        #     state.lines.copy((lane,'current'),(lane,'stage2'))
-        #     resync(lane, order=2, der=0, x0=0.5, z0=200)
-        #     state.lines.copy((lane,'current'),(lane,'stage3'))
-        #     z_max1 = resync(lane, order=4, der=0, x0=0.2, z0=1000)
-        #     print('Resync z_max %s lane = %4.1f' % (lane,z_max1), end='')
-            
-        #     # We immediately clear each side of the line and try again to check if we are stable
-        #     clear_lanes([lane])
-        #     state.lines.copy((lane,'last'),(lane,'current'))
-        #     state.lines.move((lane,'current'), origin=state.delta, dir=0)
-        #     # Two stage resync:
-        #     resync('new', order=2, der=0, x0=0.5, z0=30)
-        #     z_max2 = resync('new', order=4, der=0, x0=0.4, z0=1000)
-        #     if z_max2 < 0.8*z_max1:
-        #         print('... failed! z_max2 = %4.1f' % z_max2)
-        #         state.lines.copy((lane,'last'),(lane,'current'))
-        #         state.lines.move((lane,'current'), origin=state.delta, dir=0)
-        #     else:
-        #         print('... stable.')
-        #         state.lines.set((lane,'current'),'zmax',z_max2)
-        #         if not(lane in state.sync): state.sync.append(lane)
-        #         # If sync stable, Erase newly sync'ed line
-        #         state.lines.draw((lane,'current'),overlay[0], origin=state.origin, scale=state.scale,
-        #                          color=BLACK, width=2.)
-        #         state.lines.draw((lane,'current'),pixels[0], origin=state.origin, scale=state.scale,
-        #                          color=MAGENTA, width=2.)
-        #     if lane in state.nosync:
-        #         state.nosync.remove(lane)
-        #         failed.append(lane)
-                
-        # state.nosync = failed
                 
         # Measure lane width
         l_center = self.lines.eval( curK('left'),  z=z_sol )  
