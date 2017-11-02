@@ -251,22 +251,27 @@ class Line(ABC):
         return self._color
 
     @classmethod
-    def _normalize_color(cls, color):
+    def _normalize_color(cls, color, nb_ch=4):
         """
         Be flexible regarding color format, but always store as numpy array of uint8.
+        Optionally truncate to a given number of channels.
         """
         color = np.array(list(color))
-        if color.dtype == np.int64:
+        if np.can_cast(color, np.uint8, casting='safe'): # dtype-based comparison
+            color = color.astype(np.uint8)
+        elif np.can_cast(color, np.int64, casting='safe'):
             if all([np.can_cast(c, np.uint8, casting='safe') for c in color]):
                 color = color.astype(np.uint8)
             else:
                 raise ValueError('Line.color: integer RGBA color values must be in [0, 255].')
-        else:
+        elif np.can_cast(color, np.float64, casting='safe'):
             # Must be float between 0 and 1
             if color.min() < 0. or color.max() > 1.:
                 raise ValueError('Line.color: float RGBA color values must be in [0., 1.].')
             color = np.round(color*255.).astype(np.uint8)
-        return color[:4]
+        else:
+            raise ValueError('Line.color: invalid color %s. Use RGB representation as list or numpy array.'%repr(color))
+        return color[:nb_ch].tolist()
     
     @color.setter
     def color(self, color):
@@ -327,21 +332,17 @@ class Line(ABC):
         blended into the image.
         Returns None: the line is drawn in image.
         """
-        height, _, nb_ch = image.shape
-        sx,sy = scale
-        try:
-            # retrieve 'zmax'
-            z_max = self._geom[key]['zmax']
-        except KeyError:
-            z_max = np.inf
-        z_max = min(z_max, sy*height)
-
         try:
             # retrieve 'dens'
             density = self._geom[key]['dens']
         except KeyError:
             density = 1
             
+        # Enable blinking line if there are dashes
+        # Callers can test blinking.
+        if density < 0.6:
+            self.blink = 9
+        
         # Blink processing
         if self._blink_counter < self._blink:
             self._blink_counter += 1
@@ -349,11 +350,6 @@ class Line(ABC):
                 self._blink_state = not(self._blink_state)
                 self._blink_counter = 0
                 
-        # Enable blinking line if there are dashes
-        # Callers can test blinking.
-        if density < 0.6:
-            self.blink = 9
-        
         # Create buffer
         # Make a fresh road image buffer from image
         buffer = np.zeros_like(image, subok=True)
@@ -363,10 +359,20 @@ class Line(ABC):
             # Create a warped buffer
             buffer = warp(buffer)
 
+        height, _, nb_ch = buffer.shape
+        sx,sy = scale
+        try:
+            # retrieve 'zmax'
+            z_max = self._geom[key]['zmax']
+        except KeyError:
+            z_max = np.inf
+        z_max = min(z_max, sy*height)
+
         # Color and width processing (color is stored/normalized as values in [0,255])
-        if color is None: color = self.color
-        else:             color = Line._normalize_color(color)
-        color = color/255.
+        if color is None: color = self.color[:nb_ch]
+        else:             color = Line._normalize_color(color,nb_ch)
+        #if buffer.dtype==np.float32:
+        #color = color/255.
         if width is None: width = self.width
         
         # Call eval with key to get lane line skeleton in world coordinates
@@ -391,7 +397,7 @@ class Line(ABC):
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=list(color[:nb_ch]), shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=color, shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer
@@ -420,14 +426,6 @@ class Line(ABC):
         blended into the image.
         Returns None: the line is drawn in image.
         """
-        height, _, nb_ch = image.shape
-        sx,sy = scale
-        try:
-            # retrieve 'zmax'
-            z_max = min(self._geom[key1]['zmax'],self._geom[key2]['zmax'])
-        except KeyError:
-            z_max = sy * height
-
         # Blink processing
         if self._blink_counter < self._blink:
             self._blink_counter += 1
@@ -445,10 +443,18 @@ class Line(ABC):
             # Create a warped buffer
             buffer = warp(buffer)
 
+        height, _, nb_ch = buffer.shape
+        sx,sy = scale
+        try:
+            # retrieve 'zmax'
+            z_max = min(self._geom[key1]['zmax'],self._geom[key2]['zmax'])
+        except KeyError:
+            z_max = sy * height
+            
         # Color processing
-        if color is None: color = self.color
-        else:             color = Line._normalize_color(color)
-        color = color/255.
+        if color is None: color = self.color[:nb_ch]
+        else:             color = Line._normalize_color(color, nb_ch)
+        #color = color/255.
         
         # Call eval with key to get lane line skeleton in world coordinates
         x0,y0 = origin     # (out of image) pixel coordinates of camera location
@@ -473,7 +479,7 @@ class Line(ABC):
         points_dn.reverse()
         pts = np.array(points_up + points_dn, dtype=np.int32)
 
-        cv2.fillConvexPoly(buffer, pts, color=list(color[:nb_ch]), shift=shift, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(buffer, pts, color=color, shift=shift, lineType=cv2.LINE_AA)
         if nb_ch == 4:
             # image, buffer have depth 4
             # Alpha blend buffer

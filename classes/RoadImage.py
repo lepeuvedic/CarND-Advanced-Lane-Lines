@@ -11,7 +11,7 @@ from .CameraCalibration import CameraCalibration
 from .Line import Line
 from .LinePoly import LinePoly
 import itertools
-from functools import partial
+from functools import partial, partialmethod
 from threading import current_thread
 from random import shuffle
 
@@ -2632,8 +2632,6 @@ class RoadImage(np.ndarray):
             for li in lines:
                 state.lines.set(curK(li),'eval',0.001)
                 state.lines.set(curK(li),'order',0)
-                if li in state.sync: state.sync.remove(li)
-                if not(li in state.nosync): state.nosync.append(li)
                 
         def scoring(lines, key_in, key_out, dir, x, y, der=0):
             """
@@ -2717,6 +2715,7 @@ class RoadImage(np.ndarray):
             for K in linelib:
                 if len(K) < 2: continue
                 li, counter = K[:2]
+                if not(isinstance(counter,int)): continue
                 if counter < recent or not(li in lines): continue
                 try:
                     lines_dict[li].append(K)
@@ -2762,8 +2761,8 @@ class RoadImage(np.ndarray):
         if state is None:
             state = State()
             RoadImage.find_lines.state = state
-            state.nosync = ['left','right']
-            state.sync = []   # up to ['left', 'right'] 
+            state.lz = z
+            state.rz = z
             state.delta = (0,0)
             state.curv = 0       # lane curvature
             state.lanew = 3.7    # lane width
@@ -2786,8 +2785,8 @@ class RoadImage(np.ndarray):
         self.lines = state.lines
 
         # Colors
-        GREEN = np.array([ 0., 0.9, 0.6, 0.6 ])
-        RED = np.array([ 1., 0.1, 0., 0.5 ])
+        GREEN = np.array([ 0, 229, 153, 100 ])
+        RED = np.array([ 255, 25, 0., 128 ])
         BLACK = [0,0,0,255]  # Used to erase already identified lanes
         MAGENTA = [192,0,192,64]
         
@@ -2817,20 +2816,29 @@ class RoadImage(np.ndarray):
         state.counter += 1
         
         curvrange = (curvature, curvature)
-        _warpo   = lambda _img: _img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
-        _warp   = lambda _img: _warpo(_img)[0]
-        _unwarp = lambda _img: _img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
+        #_warpo   = lambda _img: _img.warp(  state.cal, z=state.zmax, h=h, scale=state.scale, curvrange=curvrange)
+        _warpomethod = partialmethod(RoadImage.warp, state.cal, z=state.zmax, h=h,
+                                     scale=state.scale, curvrange=curvrange)
+        setattr(RoadImage,'_warpo',_warpomethod)
+        #_unwarp = lambda _img: _img.unwarp(z=state.zmax, h=h, scale=state.scale, curvrange=curvrange, cal=state.cal)
+        _unwarpmethod = partialmethod(RoadImage.unwarp, z=state.zmax, h=h,
+                                      scale=state.scale, curvrange=curvrange, cal=state.cal)
+        setattr(RoadImage,'_unwarpm',_unwarpmethod)
+        #_warpo  = lambda _img: _img._warpomethod()
+        _warp   = lambda _img: _img._warpo()[0]
+        _unwarp = lambda _img: _img._unwarpm()
 
         # Image preprocessing
         # -------------------
         gray = img.to_grayscale()
         gray = gray.threshold(mini = 0.5)
-        overlay, origin = _warpo(gray)
+        import pdb;pdb.set_trace()
+        overlay, origin = gray._warpo() #_warpo(gray)
         state.origin = (origin[0,0],origin[0,1])
-        _, h,w,ch = overlay.shape
+        _, _,w,ch = overlay.shape
 
         sums = np.sum(overlay.astype(np.int),axis=(-2,-1))
-        overlay = overlay.to_float().rgb()
+        overlay = overlay.to_float()
 
         if np.max(sums[0,100:]) > 100:
             # Light colored pavement ahead
@@ -2890,7 +2898,7 @@ class RoadImage(np.ndarray):
                     maskw, order, x0, z0, nextev = 1, 4, 0.5, 1000, 1.0
 
                 # Make a copy and render estimated line as a mask (extending zmax)
-                mask = np.zeros_like(overlay, dtype=np.uint8)
+                mask = np.zeros_like(overlay.channel(0), dtype=np.uint8)
                 
                 z_max = state.lines.stats(K,'zmax')
                 if z_max: state.lines.set(K,'zmax', 2*z_max)
@@ -2954,35 +2962,51 @@ class RoadImage(np.ndarray):
                     # Fast convergence
                     print('+',end='')
                     #print("Fast convergence!")
+                elif order == 4:
+                    #print("Synchronized.")
+                    # Erase line from overlay: it helps curves focus on the remaining, less visible lines
+                    state.lines.draw(K,overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
+                                     width=maskw)
+                    break
                 elif ev <= initial_eval:
                     # Resync is stuck
-                    if order == 4: break  # not an issue when we are already at order 4
                     if ev <= initial_eval * 0.9:
                         print("Lost sync! ev %6.4f < %6.4f initial_eval" % (ev,initial_eval))
                         # eliminate solution from pool
                         state.lines.delete(K)
                     break
                 # Possibly other quality considerations here...
-                if order == 4:
-                    # Slow convergence but order is already the maximum
-                    #print("Synchronized.")
-                    if K[0] in state.nosync: state.nosync.remove(K[0])
-                    if not(K[0] in state.sync): state.sync.append(K[0])
-                    # Erase line from overlay: it helps curves focus on the remaining, less visible lines
-                    state.lines.draw(K,overlay[0], origin=state.origin, scale=state.scale, color=BLACK, 
-                                     width=maskw)
-                    break
             # Loop to increase stage
 
-                    
-                
+        # Detection finished. In case of failures to detect, we generate solutions from past solutions
+        if state.lines.exist(curK('left')):
+            lz = state.lines.stats(curK('left'),'zmax')
+            if lz: state.lz = lz
+        else:
+            initial_estimates(['left'], keepn=6)
+            state.lz *= 0.9
+    
+        if state.lines.exist(curK('right')):
+            rz = state.lines.stats(curK('right'),'zmax')
+            if rz: state.rz = rz
+        else:
+            initial_estimates(['right'], keepn=6)
+            state.rz *= 0.9
+               
         # Measure lane width
-        l_center = self.lines.eval( curK('left'),  z=z_sol )  
-        r_center = self.lines.eval( curK('right'), z=z_sol ) 
+        distk = np.array([1,2,3])
+        # eval at low multiples of z_sol since farther out there are perspective errors 
+        l_center = np.mean(self.lines.eval( curK('left'),  z=z_sol*distk ))
+        r_center = np.mean(self.lines.eval( curK('right'), z=z_sol*distk ))
         lane_width = r_center - l_center
-        if lane_width > 3.:  # state.lanew is used in detection: shouldn't wander too far off.
+        if lane_width > 3.5 and lane_width < 3.9 :
+            # state.lanew is used in detection: shouldn't wander too far off.
             state.lanew = lane_width
-
+        # reassess l_center and r_center based on official lane width
+        corrlw = state.lanew/lane_width
+        l_center *= corrlw
+        r_center *= corrlw
+            
         # TODO: reassess short term camera height based on perceiveed short-distance lane_width.
         # Camera height is defined by the car's geometry, but it can have short term variations
         # around an average value due to the car's suspensions. Long term and large variations of
@@ -2994,36 +3018,33 @@ class RoadImage(np.ndarray):
         #     cam height = f(ac_lw)
 
         backgnd = img
-        cv2.putText(backgnd,"%0.2f" % (-l_center), (int(640 - 100*lane_width/2), 55),
-                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
-        cv2.putText(backgnd,"%0.2f" % r_center, (int(640 + 100*lane_width/2 - 135), 55),
-                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
-        cv2.line(backgnd,(int(640 - 100*lane_width/2), 70),(int(640 + 100*lane_width/2), 70),
-                 color=GREEN, thickness=2)
-        cv2.circle(backgnd,(int(640 - 100*(lane_width/2 + l_center)), 70), 10, color=GREEN, thickness=2)
+        green = GREEN.tolist()
+        cv2.putText(backgnd[0],"%0.2f" % (-l_center), (int(640 - 100*state.lanew/2), 55),
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        cv2.putText(backgnd[0],"%0.2f" % r_center, (int(640 + 100*state.lanew/2 - 135), 55),
+                    fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
+        cv2.line(backgnd[0],(int(640 - 100*state.lanew/2), 70),(int(640 + 100*state.lanew/2), 70),
+                 color=green, thickness=2)
+        cv2.circle(backgnd[0],(int(640 - 100*(state.lanew/2 + l_center)), 70), 10, color=green, thickness=2)
         if curvature > 0.0005:
-            cv2.putText(backgnd,"R=%4d m" % int(1/curvature), (860,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
+            cv2.putText(backgnd[0],"R=%4d m" % int(1/curvature), (860,250),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
         elif curvature < -0.0005:
-            cv2.putText(backgnd,"R=%4d m" % int(-1/curvature), (100,250),
-                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=GREEN, thickness=2)
+            cv2.putText(backgnd[0],"R=%4d m" % int(-1/curvature), (100,250),
+                        fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=4, color=green, thickness=2)
 
         # Draw on background image
-        if 'left' in state.sync and 'right' in state.sync:
-            print("z_max =",z_max)
-            #z_max = (min(lz,rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
-            #if z_max < 0: z_max=0
-            z_max=1
-            color = GREEN * z_max + RED * (1-z_max)
-            
-            self.lines.draw_area( curK('left'), curK('right'), backgnd[0], origin=state.origin, scale=scale, color=color,
-                                  warp=_warp, unwarp=_unwarp)
+        z_max = (min(state.lz,state.rz)-10) / (z-10)      # ratio of achieved z to desired z (full red at 10 m)
+        if z_max < 0: z_max=0
+        color = (GREEN * z_max + RED * (1-z_max)).astype(np.uint8)
+        self.lines.draw_area( curK('left'), curK('right'), backgnd[0], origin=state.origin, scale=scale, color=color,
+                              warp=_warp, unwarp=_unwarp)
         # Draw synchronized lanes
-        for line in state.sync:
-            state.lines.draw(curK(line), backgnd[0], color=[1.,1.,0.,.6], origin=state.origin, scale=state.scale,
+        for line in ['left','right']:
+            state.lines.draw(curK(line), backgnd[0], color=[255,255,0,150], origin=state.origin, scale=state.scale,
                              warp=_warp, unwarp=_unwarp)
 
-        return img
+        return backgnd
     
     def centroids(self, *, x, lanew, scale):
         """
