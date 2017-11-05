@@ -52,146 +52,6 @@ class LinePoly(Line):
         # Store result
         self._geom[key]['poly']=q
         
-    def estimate(self, key, image, *, origin, scale, order=None):
-        """
-        Analyses the image to create an analytical representation of a lane line. The image, by
-        definition comes from the camera, and is oriented in the ahead direction (warping corrects
-        the difference between camera center direction and car ahead direction).
-
-        The origin is always below the image at (x=x0, y=height+z_sol / sy). x0 is the second
-        parameter returned by RoadImage.warp_size. height is also provided by this function
-        as part of the tuple it returns as its first return value. z_sol is accessible via y0
-        in origin.
-
-        scale is a tuple (sx,sy) which relates pixels in image to real world coordinates.
-        sx and sy are expressed in m/pixel.
-        
-        key is an arbitrary key the class will use to store the information.
-
-        Returns a tuple ( line density , z_max ), where line density can help determine if
-        the line is solid (should be near 1) or dashed (should be closer to 0.3).
-        """
-        # Specific arguments
-        if order is None: order = self._default_order
-        
-        def weight(z):
-            """
-            Associate a weight to pixels based on real distance from camera.
-            A law in exp -z/z0 is used
-            """
-            z0 = 100.
-            return np.exp(-z/z0)
-
-        def genpoly(n,x,y,z,order):
-            """
-            n : number of samples to average
-            x : array of x coords
-            y : same length array of y coords
-            z : maximum y0-y to keep (x,y,z in pixels)
-            order: polynom order
-            """
-            # Also uses 'origin" and 'scale' from outer function args, and 'weight' sister subfunction.
-            # Keep points closer than z
-            sel = (y<=z)
-            xf = x[sel]
-            yf = y[sel]
-            if(len(xf)<order+1):
-                raise ValueError('LinePoly.estimate.genpoly: z too low (%0.1f) leaves too few points (%d/%d).'
-                                 % (z, len(xf), len(x)))
-            for i in range(n):
-                # Subsample and center data on x0,y0:
-                # Change to camera axes (and orient y in ahead direction)
-                indices = np.random.randint(len(xf),size=150)  
-                x_ = xf[indices]
-                y_ = yf[indices]
-                
-                # Fit polynomial x=f(y)
-                _, sy = scale
-                poly = np.polyfit(y_,x_,order,w=weight(y_))
-                yield poly
-
-        def poly(n,x,y,z,order):
-            MAXORDER=6
-            if order > MAXORDER: raise ValueError('LinePoly.estimate.poly: order must be <= 3.')
-            p = np.sum( p_ for p_ in genpoly(n,x,y,z_max,order) )/n
-            #print("DEBUG",order,repr(p))
-            if order < MAXORDER: p = np.concatenate([np.zeros(MAXORDER-order),p])
-            # P holds the polynomial coefficients in REVERSE order compared to p : P(x) = sum(P[n] x**n)
-            p = p[::-1]
-            return p
-
-        # The image has two layers which must be 'and'ed together. Typically one has raw
-        # extracted pixels, the other has some form of dynamic mask (e.g. centroids)
-        data = image.combine_masks('and',perchannel=False)
-        image.rgb().save('centroids.png')
-        # Extract points (squeeze to avoid the third table filled with zeroes)
-        y, x, _ = np.nonzero(data)
-        x0, y0 = origin
-        sx, sy = scale
-        del data       # in order to be able to write in image.
-
-        # Limit order based on real number of points (below order 2 cuvature is zero)
-        nb_pts = len(x)
-
-        # Convert to real world units x,z (which are typically closer to zero and lead
-        # to better conditioned system in fitpoly).
-        Y = (y0-y)*sy
-        X = (x-x0)*sx
-        
-        # Rename old 'current' poly as 'last'
-        try:
-            oldpoly = None
-            lastkey = ('last',)+key[1:]
-            self._geom[lastkey] = self._geom[key]   # KeyError if there is no current _geom[key]
-            del self._geom[key]
-            oldpoly = self._geom[lastkey]['poly']   # KeyError is current Line does not have 'poly'
-            # Since we have oldpoly, normalize data
-            oldx = self.eval(lastkey, z=Y)          # cannot fail since 'poly' exists
-            X -= oldx
-        except KeyError:
-            # No past attempt
-            pass
-        
-        z_max = y0*sy
-        K=0.75         # Allow inflexion point, but far enough away
-        fail3 = True
-        try: # 4th degree polynomial
-            while z_max>y0*sy/2 and nb_pts >= 100:
-                # Get polynomial estimate. ValueError if z_max is too low and eliminates all the pts.
-                p = poly(10,X,Y,z_max,4) # all in real units
-                # add oldpoly
-                if not(oldpoly is None): p += oldpoly
-                # Compute distance to inflexion point (with 3rd degree)
-                #z_inflex = -p[2]/(3*p[3])
-                #if (z_inflex > 0 and z_inflex < K*z_max):
-                #    # Inflexion is poorly placed, but curvature may be negligible
-                #    curv = self.curvature(p,z=np.array([0, K*z_max]))
-                #    fail3 = (np.max(abs(curv))>5e-4)  # very small inflexion (straight)
-                #else:
-                fail3 = False # no inflexion
-                #print('DEBUG:',p)
-                if not(fail3): break # Found acceptable solution
-                #print("DEBUG: Inflexion point at %.0f m < %.0f ? z_max=%.0f" % (z_inflex,K*z_max,z_max))
-                z_max *= 0.9
-        except ValueError as e:
-            print('poly exception:'+str(e))
-            pass
-        
-        if fail3:
-            z_max = K*y0*sy    # Don't use 25% farthest
-            try: # 2nd order
-                print("Order 2 forced, z_max =",z_max," Nb pts =",nb_pts)
-                p = poly(10,X,Y,z_max,2)
-                if oldpoly: p += oldpoly
-            except ValueError:
-                raise RuntimeError('LinePoly.estimate: failed to find line')
-
-        density = nb_pts / (image.shape[0]*(self.width/sx))
-        self._geom[key] = { 'poly':p, 'dens':density, 'zmax': z_max, 'op':'est' }
-
-        #print("DEBUG: density = %0.1f%%  z_max = %0.0f m." % (density*100,z_max))
-        return ( density , z_max )
-        
     def eval(self, key, *, z, der=0):
         """
         Computes real world x coordinates associated to z coordinates supplied as a numpy array.
@@ -210,6 +70,39 @@ class LinePoly(Line):
         # one line polynomial evaluation independent of P order: returned type is same as z
         return sum( p_ * z**n for n,p_ in enumerate(P))
 
+    def tangent(self, key, *, z, order=1):
+        """
+        Simplifies key to a geomtry of order=order, which is tangent to key at z=z.
+        """
+        Qk = self._geom[key]['poly']
+        Qk = np.trim_zeros(Qk,'b')
+        if len(Qk)==0: return   # Qk is already of very low order since Qk=0
+        k = len(Qk)-1   # order of polynom Qk
+        if k<= order: return
+        
+        from math import factorial as fact
+
+        def coef(i,j,z):
+            if i<j: return 0
+            return fact(i) * z**(i-j) / fact(i-j)
+
+        def mat(n,k,x0):
+            return [[coef(i,j,x0) for i in range(k+1)] for j in range(n+1)]
+
+        # Eliminate trailing zeros otherwise matrix A is singular (when order of P1 is less than len(P1)-1)
+        B = mat(order, k, z)  # B is an 0:n-by-0:k matrix
+        b = np.dot(B,Qk)
+        A = mat(order, order, z)
+        a = np.linalg.solve(A,b)
+
+        # Extend with zeros to default order
+        Pn = np.zeros(self._default_order+1, dtype=np.float)
+        Pn[:len(a)] = a
+        # Store result
+        self._geom[key]['poly']=Pn
+        self._geom[key]['order']=order
+        return
+        
     def delta(self, key1, key2):
         """
         Assumes that key1 and key2 describe the same geometry with an offset in the origin.
