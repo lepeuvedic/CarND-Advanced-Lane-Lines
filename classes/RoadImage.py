@@ -2231,7 +2231,8 @@ class RoadImage(np.ndarray):
         width indicates the width of the lines we are looking for in meters.
         origin is the location of the camera in x,y (in pixels and usually off the bottom of self).
         scale is (sx,sy) the scale of the warped self in meters/pixel.
-        wfunc is a weight function, which will be used to reduce the importance of points situated
+        wfunc is a weight function, which will be used to reduce the importance of points situated far from the 
+        hint.
         minpts is the number of points curves will try to pass to np.polyfit.
         sfunc is a scoring function which will be passed the key and the x and y of each contributing
         partial solution, and which should return a score between 0 and 1. It can be used to assess how
@@ -2336,6 +2337,9 @@ class RoadImage(np.ndarray):
             # Concatenate
             X = np.concatenate([X1,X2], axis=0)
             Y = np.concatenate([Y1,Y2], axis=0)
+            # Test if there are enough pixels
+            if len(X)==0: continue # No fitting algo works with zero data
+            
             # Pass everything to self.lines.fit(), which does y data conditioning using key,
             # solves, and records the geometry in its private format in self.lines.
             if dir=='x':  # verticals X=f(Y)
@@ -2347,7 +2351,11 @@ class RoadImage(np.ndarray):
                 key = self.lines.zero
                 self.lines.copy(key, resultkey)
 
-            self.lines.fit(resultkey, X, Y, wfunc=weight_func, **kwargs)
+            try: # Only now will we know if X and Y contain enough data
+                self.lines.fit(resultkey, X, Y, wfunc=weight_func, **kwargs)
+            except ValueError:
+                # lines.fit tells us our data is junk
+                continue # to next stipple pattern
 
             # Rate solution (refY cannot be done out of the loop because X changes)
             refY = self.lines.eval(key, z=X)
@@ -2440,7 +2448,11 @@ class RoadImage(np.ndarray):
             self.lines.blend(acckey,key1=acckey,key2=resultkey,
                              op='wsum', w1=1, w2=weight)
             # Draw solution...
-            
+
+        # No usable pixels
+        if acc_w == 0:
+            raise ValueError('RoadImage.curves: No useable pixels. Is image black?')
+        
         # Loop on subgrids finished - normalize result and save under arg key.
         self.lines.blend(key, key1=self.lines.zero, key2=acckey,
                          op='wsum', w1=0, w2=1/acc_w)
@@ -2661,7 +2673,7 @@ class RoadImage(np.ndarray):
             """
             # TODO : should give a bonus for well contrasted sides...
             assert warpimage.ndim==4, 'RoadImage.find_lines.eval: BUG in warpimage format / must be collection.'
-
+                
             _,y0 = origin  # Caution: weight() param is also named x0
             sx,sy = scale
             
@@ -2671,35 +2683,45 @@ class RoadImage(np.ndarray):
             state.lines.set(key,'dens',1)
             state.lines.set(key,'zmax',linebuf.shape[0]*sy)
             # Draw a thin line to limit the number of points
-            state.lines.draw(key, linebuf, origin=origin, scale=scale, color=[255], width=2*sx)
-            linebuf.track(state)
-            if not(dens is None):  state.lines.set(key,'dens',dens)
-            if not(z_max is None): state.lines.set(key,'zmax',z_max)
-            
-            y, x, _  = np.nonzero(linebuf)
-            val = warpimage[0,y,x]
-            # Convert coordinates
-            Y = (y0-y)*sy
-            # Apply weight (with itself as a reference)
-            w = weight(Y,0,val,x0,z0)
-            wref = weight(Y,0,1,x0,z0)
-            
-            ev = max(MIN_EVAL, np.sum(w)/np.sum(wref))
+            try:
+                state.lines.draw(key, linebuf, origin=origin, scale=scale, color=[255], width=2*sx)
+            except ValueError:
+                warnings.warn('RoadImage.find_lines.eval: Line.draw failed. Geometry may be invalid.')
+                #import pdb; pdb.set_trace()
+                ev = MIN_EVAL
+            else:
+                linebuf.track(state)
+                if dens is None:  state.lines.unset(key,'dens')
+                else:             state.lines.set(key,'dens',dens)
+                if z_max is None: state.lines.unset(key,'zmax')
+                else:             state.lines.set(key,'zmax',z_max)
+
+                y, x, _  = np.nonzero(linebuf)
+                val = warpimage[0,y,x]
+                # Convert coordinates
+                Y = (y0-y)*sy
+                # Apply weight (with itself as a reference)
+                w = weight(Y,0,val,x0,z0)
+                wref = weight(Y,0,1,x0,z0)
+
+                ev = max(MIN_EVAL, np.sum(w)/np.sum(wref))
+
             state.lines.set(key,'eval',float(ev))
             return ev
 
         def stageK(key,stage):
             return (key[0],state.counter,stage)
 
-        def estimates(lines, keepn=6, update=True, keeporder=False):
+        def estimates(lines, keepn=6, update=True, bestfirst=True, order=4):
             """
             Looks into state.lines to find recent line detections, and produce a list of current initial estimates
             sorted by decreasing stage of preparation.
             keepn is the number of recent geometries to use to make a new estimate.
             If update is True, the current values curK(line)  will be updated to reflect the returned values,
             otherwise the result will be associated to specific keys which will be returned.
-            Returned keys are normally sorted by decreasing evaluation. If keeporder is True, the returned keys
+            Returned keys are normally sorted by decreasing evaluation. If bestfirst is False, the returned keys
             will be in the order of argument lines instead.
+            Returned estimates will be simplified to order=order. The default is 4, meaning that they are not simplified.
             """
             lines_dict = dict()
             recent = state.counter - keepn
@@ -2750,7 +2772,7 @@ class RoadImage(np.ndarray):
                     toto = linelib.stats(K, 'order')
                     total = wght(totev,toto)
                     linelib.copy(K, tmpkey)
-                    linelib.tangent(tmpkey, z=ZTAN, order=2)
+                    linelib.tangent(tmpkey, z=ZTAN, order=order)
                     linelib.blend(tgt, op='wsum', key1=linelib.zero, key2=tmpkey, w1=1, w2=total)
                     count = 1
                     for K in it:
@@ -2762,7 +2784,7 @@ class RoadImage(np.ndarray):
                         total = total + w_
                         count += 1
                         linelib.copy(K, tmpkey)
-                        linelib.tangent(tmpkey, z=ZTAN, order=2)  # Take tangent at 10 m order 2 solution
+                        linelib.tangent(tmpkey, z=ZTAN, order=order)  # Take tangent at 10 m order 2 solution
                         linelib.blend(tgt, op='wsum', key1=tgt, key2=tmpkey, w1=1, w2=w_)
 
                     linelib.blend(tgt, op='wsum', key1=tgt, key2=state.lines.zero, w1=1/total, w2=0)
@@ -2770,7 +2792,7 @@ class RoadImage(np.ndarray):
                     linelib.set(tgt,'order', toto/count) # Fractional, just to know... doesn't seem to hurt.
 
             ret = [target[li] for li in lines]
-            if keeporder: return ret
+            if not(bestfirst): return ret
             return sorted(ret, key=lambda K: linelib.stats(K,'eval'), reverse=True)
         
         def log(K,m=''):
@@ -2996,13 +3018,18 @@ class RoadImage(np.ndarray):
                 focus_k  = (1/x0)**(1/maxiters)  # the 1st '1' is x0 = 1 meter at stage 1.
 
                 while ev<0.05 or ev>=best_eval*0.9:  # Convergence : K changes at each call of curves
-                    
-                    z_max = mask.curves(K, dir='x', order=order,
-                                        origin=origin, scale=scale,
-                                        sfunc=partial(scoring, der=der),
-                                        wfunc=partial(weight,val=1,x0=x0,z0=z0))
+                    try:
+                        z_max = mask.curves(K, dir='x', order=order,
+                                            origin=origin, scale=scale,
+                                            sfunc=partial(scoring, der=der),
+                                            wfunc=partial(weight,val=1,x0=x0,z0=z0))
+                    except ValueError: # Catch image is black? exception
+                        mask.track(state)
+                        reinit_lines(lines=[K[0]])
+                        order = 0
+                    else:
+                        state.lines.set(K,'order',order)
                     ev = my_eval(K, x0=x0, z0=z0)
-                    state.lines.set(K,'order',order)
                     log(K,'K')
                     
                     if ev > best_eval*1.01: # Minimal improvement +1% 
@@ -3011,7 +3038,7 @@ class RoadImage(np.ndarray):
                         state.lines.copy(K,curK('save'))
                     elif ev > nextev:
                         # We are not improving any more, but we have reached the ev level for the next higher order.
-                        if ev<best_eval*0.95:
+                        if ev < best_eval*0.95:
                             # Restore best solution only if the current one is significantly worse
                             state.lines.copy(curK('save'),K)
                         break
@@ -3019,13 +3046,10 @@ class RoadImage(np.ndarray):
                         maxiters  -= 1     # else consume one "free" iteration
                         x0 *= focus_k      # but focus, since distant noise can otherwise keep us just beside a line
                         z0 /= focus_k**2   # and look farther ahead to try to catch dashes, rather than noise
-                    #print('%4.2f,'%ev,end='')
                     #print('.',end='')
                     if maxiters == 0: break
                 else:
                     # This exit is taken only if ev falls lower than best_eval*0.9
-                    #if improving<1:
-                    #    print("No improvement at order %d." % order)
                     # Restore best solution for this stage
                     state.lines.copy(curK('save'),K)
                     log(K,'S')
@@ -3075,7 +3099,7 @@ class RoadImage(np.ndarray):
 
         # Detection finished. In case of failures to detect, we generate solutions from past solutions
         
-        key1, key2 = estimates(['left','right'], keepn=state.keepdraw, update=False, keeporder=True)
+        key1, key2 = estimates(['left','right'], keepn=state.keepdraw, update=False, bestfirst=False)
         log(key1,'W')
         log(key2,'W')
         

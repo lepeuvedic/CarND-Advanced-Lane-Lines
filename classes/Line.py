@@ -142,7 +142,8 @@ class Line(ABC):
         Delete reference to a geometry. A geometry may be referenced multiple times.
         It will disappear when it is no longer referenced.
         """
-        del self._geom[key]
+        if self.exist(key): del self._geom[key]
+        return
 
     def copy(self, key1, key2):
         """
@@ -249,7 +250,16 @@ class Line(ABC):
             raise ValueError('Line.set: Cannot set poly.')
         self._geom[key][name] = val
         return
-        
+
+    def unset(self, key, name):
+        """
+        Removes a piece of caller owned data.
+        """
+        if name == 'poly':
+            raise ValueError('Line.unset: Cannot unset poly.')
+        del self._geom[key][name]
+        return
+    
     @property
     def color(self):
         """
