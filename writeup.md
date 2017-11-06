@@ -397,7 +397,7 @@ cal.save('camera_cal/calibration.p')
 ```
 
 
-![png](output_images/checker_undistort.png)
+![checker_undistort.png](output_images/checker_undistort.png)
 
 
 The code cell above creates the two lists `objpoints` and `imgpoints` of matching 3D to 2D (pixel) coordinate pairs. This data is the input of the `CameraCalibration` constructor, which calculates the parameter set we need to undistort the images and stores it in the instance `cal`. Note that 3D coordinates are in an arbitrary set of axes, and in our case, the axes are local to the chessboard pattern, giving integer coordinates (0,0,0) to (8,5,0). All the points are in the Z=0 plane, which is the plane of the chessboard.
